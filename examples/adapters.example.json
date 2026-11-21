@@ -1,0 +1,21 @@
+{
+  "adapters": [
+    {
+      "id": "freecad",
+      "name": "FreeCAD",
+      "executable": "C:/Program Files/FreeCAD 1.0/bin/FreeCADCmd.exe",
+      "extensions": ["step", "stp", "iges", "igs", "brep"],
+      "type": "script",
+      "script": "../lib/freecad_convert.py",
+      "args": ["{script}", "{input}", "{output}", "{report}"]
+    },
+    {
+      "id": "generic-cli",
+      "name": "通用命令行转换器示例",
+      "executable": "C:/tools/my-converter.exe",
+      "extensions": ["xxx"],
+      "type": "command",
+      "args": ["convert", "--input", "{input}", "--output", "{output}", "--format", "glb"]
+    }
+  ]
+}

@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>建模工作台</title>
+<style>
+  :root {
+    --bg: #eef1f4; --panel: #ffffff; --panel-2: #f6f8fa; --border: #d4dae2;
+    --text: #17222e; --muted: #5a6a7a; --accent: #0e7490; --accent-soft: #e0f2f7;
+    --accent-text: #ffffff; --danger: #b42318; --ok: #157f3d; --warn: #9a6700;
+    --sel: #c026d3; --viewport-bg: #e8edf2; --hover: #eaf0f5; --radius: 8px;
+    --axis-x: #dc2626; --axis-y: #16a34a; --axis-z: #2563eb;
+    --shadow: 0 8px 28px rgba(15, 30, 45, .16);
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d1117; --panel: #161c24; --panel-2: #1c242e; --border: #2c3745;
+    --text: #e4eaf2; --muted: #93a3b5; --accent: #22d3ee; --accent-soft: #10333d;
+    --accent-text: #06222b; --danger: #f97066; --ok: #4ade80; --warn: #fbbf24;
+    --sel: #e879f9; --viewport-bg: #10151c; --hover: #223041;
+    --axis-x: #f87171; --axis-y: #4ade80; --axis-z: #60a5fa;
+    --shadow: 0 8px 28px rgba(0, 0, 0, .5);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+  }
+  button, select, input { font: inherit; color: inherit; }
+  button {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 10px; cursor: pointer; white-space: nowrap;
+    transition: background .12s, border-color .12s, transform .06s;
+  }
+  button:hover:not(:disabled) { background: var(--hover); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  select, input[type="text"], input[type="number"] {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+  }
+  .muted { color: var(--muted); }
+  [hidden] { display: none !important; }
+
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--accent) 38%, var(--border));
+    border-radius: 6px; border: 2px solid var(--panel);
+  }
+  *::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+  * { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--accent) 38%, var(--border)) transparent; }
+
+  header {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border); z-index: 25;
+  }
+  header .brand { font-weight: 700; margin-right: 2px; letter-spacing: .3px; }
+  header .brand::before { content: "◆ "; color: var(--accent); }
+  header .spacer { flex: 1; }
+  #modelSelect { max-width: 200px; }
+  #pathWrap { display: inline-flex; gap: 4px; align-items: center; }
+  #pathInput { width: 240px; }
+  .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .segmented button { border: none; border-radius: 0; }
+  #syncBadge { font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+  #syncBadge[data-state="synced"] { color: var(--ok); border-color: var(--ok); }
+  #syncBadge[data-state="syncing"], #syncBadge[data-state="pending"] { color: var(--warn); border-color: var(--warn); }
+  #syncBadge[data-state="error"] { color: var(--danger); border-color: var(--danger); }
+  .menu-wrap { position: relative; }
+  #exportMenu {
+    position: absolute; right: 0; top: calc(100% + 4px); z-index: 60; min-width: 180px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); display: flex; flex-direction: column; padding: 4px;
+  }
+  #exportMenu button { border: none; text-align: left; padding: 8px 10px; border-radius: 6px; }
+  .narrow-only { display: none; }
+
+  #main { flex: 1; display: flex; min-height: 0; position: relative; }
+
+  /* ---- 左侧：盘大纲 + 渲染控制 ---- */
+  #outliner {
+    width: 248px; flex-shrink: 0; background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  body.outliner-collapsed #outliner { display: none; }
+  body.props-hidden #propsPanel { display: none; }
+  .side-head {
+    display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+    border-bottom: 1px solid var(--border); font-weight: 600;
+  }
+  .side-head .spacer { flex: 1; }
+  .side-head button { padding: 2px 8px; font-size: 12px; }
+  #plateTree { flex: 1; overflow-y: auto; padding: 6px; min-height: 60px; }
+  .plate { margin-bottom: 4px; }
+  .plate-head {
+    display: flex; align-items: center; gap: 4px; border-radius: 6px; padding: 3px 4px; cursor: pointer;
+    border-left: 3px solid transparent;
+  }
+  .plate-head:hover { background: var(--hover); }
+  .plate.active > .plate-head { background: var(--accent-soft); border-left-color: var(--accent); }
+  .plate-caret { border: none; background: transparent; padding: 0 2px; width: 18px; color: var(--muted); }
+  .plate-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plate-badge { font-size: 11px; color: var(--accent); border: 1px solid var(--accent); border-radius: 8px; padding: 0 6px; }
+  .plate-items { margin-left: 20px; display: flex; flex-direction: column; gap: 1px; }
+  .plate.collapsed .plate-items { display: none; }
+  .item-row {
+    display: flex; align-items: center; gap: 5px; border-radius: 6px; padding: 2px 4px; cursor: pointer;
+  }
+  .item-row:hover { background: var(--hover); }
+  .item-row.selected { background: var(--accent-soft); outline: 1px solid var(--sel); }
+  .item-row .item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item-row.hidden-item .item-name { opacity: .45; text-decoration: line-through; }
+  .eye { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+  .tree-empty { padding: 10px 8px; font-size: 12px; }
+  .rename-input { width: 100%; padding: 1px 4px; font-size: 13px; }
+
+  #renderControls { border-top: 1px solid var(--border); padding: 8px 10px 10px; overflow-y: auto; max-height: 46%; }
+  #renderControls h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; }
+  .ctl { display: grid; grid-template-columns: 64px 1fr 34px; gap: 6px; align-items: center; margin-bottom: 5px; }
+  .ctl label { font-size: 12px; color: var(--muted); }
+  .ctl output { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; background: transparent; cursor: pointer; padding: 0; border: none; }
+  input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; margin-top: -4.5px;
+    background: var(--accent); border: 2px solid var(--panel); box-shadow: 0 0 0 1px var(--accent);
+  }
+  input[type="range"]::-moz-range-track { height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+  input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border-radius: 50%; background: var(--accent); border: 2px solid var(--panel); }
+  .ctl-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  .ctl-row label { font-size: 12px; display: inline-flex; gap: 4px; align-items: center; color: var(--muted); }
+  .ctl-row select { padding: 2px 6px; font-size: 12px; }
+  .ctl-row button { padding: 2px 8px; font-size: 12px; }
+
+  /* ---- 中央视口 ---- */
+  #viewport { flex: 1; position: relative; min-width: 0; background: var(--viewport-bg); }
+  #canvasHost { position: absolute; inset: 0; }
+  #canvasHost canvas { display: block; width: 100%; height: 100%; }
+  .floatbar {
+    position: absolute; left: 10px; display: flex; gap: 4px; flex-wrap: wrap; z-index: 10;
+    background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 4px; backdrop-filter: blur(4px);
+  }
+  #viewBar { top: 10px; }
+  #editBar { bottom: 10px; }
+  .floatbar button { padding: 3px 8px; font-size: 12px; }
+  .floatbar .sep { width: 1px; background: var(--border); margin: 2px; }
+
+  #gizmoHit { position: absolute; top: 8px; right: 8px; width: 120px; height: 120px; z-index: 12; cursor: pointer; border-radius: 50%; }
+
+  #emptyState, #loadingOverlay, #webglError, #dropOverlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px;
+    align-items: center; justify-content: center; text-align: center; padding: 24px; z-index: 5;
+  }
+  #loadingOverlay { background: color-mix(in srgb, var(--viewport-bg) 80%, transparent); z-index: 20; }
+  #dropOverlay {
+    z-index: 35; background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 3px dashed var(--accent); pointer-events: none; font-size: 16px; font-weight: 600;
+  }
+  #emptyState h2 { margin: 0; font-size: 16px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; max-width: 440px; }
+  .chips span { border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px; font-size: 12px; color: var(--muted); background: var(--panel); }
+  .spinner { width: 26px; height: 26px; border-radius: 50%; border: 3px solid var(--border); border-top-color: var(--accent); animation: spin .9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- 右键菜单 ---- */
+  #ctxMenu {
+    position: fixed; z-index: 80; min-width: 168px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 4px; display: flex; flex-direction: column;
+  }
+  #ctxMenu button { border: none; text-align: left; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+  #ctxMenu .ctx-label { font-size: 11px; color: var(--muted); padding: 5px 10px 2px; }
+  #ctxMenu hr { border: none; border-top: 1px solid var(--border); margin: 4px 6px; }
+
+  /* ---- 对话框 ---- */
+  .dialog {
+    position: absolute; inset: 0; z-index: 45; display: flex; align-items: center; justify-content: center;
+    background: rgba(8, 14, 20, .4);
+  }
+  .dialog .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; width: min(440px, 92%); display: flex; flex-direction: column; gap: 10px;
+    box-shadow: var(--shadow); animation: pop .16s ease-out;
+  }
+  @keyframes pop { from { transform: scale(.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .dialog .card strong { font-size: 14px; }
+  #savePathInput, #newPlateName { width: 100%; }
+  .dialog .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  /* ---- 右侧：属性表（选中后固定） ---- */
+  #propsPanel {
+    width: 268px; flex-shrink: 0; background: var(--panel); border-left: 1px solid var(--border);
+    overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 12px;
+  }
+  #propsPanel h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  #pinBadge { font-size: 11px; color: var(--sel); border: 1px solid var(--sel); border-radius: 8px; padding: 0 6px; }
+  #propsName { width: 100%; font-weight: 600; }
+  .plate-chip { display: inline-block; font-size: 11px; background: var(--accent-soft); color: var(--accent); border-radius: 8px; padding: 1px 8px; margin-top: 4px; }
+  .grid3 { display: grid; grid-template-columns: auto 1fr 1fr 1fr; gap: 4px; align-items: center; }
+  .grid3 label { color: var(--muted); font-size: 12px; }
+  .grid3 input { width: 100%; min-width: 0; padding: 3px 5px; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .btn-grid button { font-size: 12px; padding: 5px 6px; }
+  .origin-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .origin-grid button { font-size: 12px; padding: 5px 4px; }
+  .ai-box { border: 1px dashed var(--border); border-radius: var(--radius); padding: 10px; }
+  .ai-box p { margin: 6px 0 0; font-size: 12px; }
+  .ai-box .row input { flex: 1; min-width: 0; }
+  #plateSummary { font-size: 12px; }
+  #plateSummary table { width: 100%; border-collapse: collapse; }
+  #plateSummary td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
+  #plateSummary td:last-child { text-align: right; color: var(--muted); }
+
+  /* ---- 通知 ---- */
+  #toasts {
+    position: absolute; bottom: 46px; left: 50%; transform: translateX(-50%);
+    display: flex; flex-direction: column; gap: 6px; z-index: 70; align-items: center; pointer-events: none;
+  }
+  .toast {
+    pointer-events: auto; display: flex; gap: 10px; align-items: center;
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: var(--radius); box-shadow: var(--shadow); padding: 8px 12px; font-size: 13px;
+    animation: rise .18s ease-out; max-width: min(480px, 86vw);
+  }
+  .toast.error { border-left-color: var(--danger); }
+  .toast button { padding: 2px 10px; font-size: 12px; }
+  @keyframes rise { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+  footer {
+    display: flex; gap: 12px; align-items: center; padding: 5px 12px;
+    background: var(--panel); border-top: 1px solid var(--border); font-size: 12px; min-height: 28px;
+  }
+  #statusText { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #statusText[data-error="true"] { color: var(--danger); }
+  #statsText { color: var(--muted); white-space: nowrap; }
+
+  @media (max-width: 900px) {
+    #outliner { width: 216px; }
+    #propsPanel { width: 232px; }
+    #pathInput { width: 150px; }
+  }
+  @media (max-width: 700px) {
+    .narrow-only { display: inline-block; }
+    #outliner { position: absolute; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: var(--shadow); width: 236px; }
+    #propsPanel { position: absolute; right: 0; top: 0; bottom: 0; z-index: 30; box-shadow: var(--shadow); width: 240px; }
+    #statsText { display: none; }
+    #modelSelect { max-width: 130px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">建模工作台</span>
+  <button id="outlinerToggle" type="button" aria-pressed="true" title="收起 / 展开左侧盘大纲">盘大纲</button>
+  <button id="propsToggle" type="button" aria-pressed="true" title="收起 / 展开右侧属性表">属性</button>
+  <select id="modelSelect" aria-label="重新导入已加载模型"></select>
+  <button id="openFileBtn" type="button">打开文件</button>
+  <span id="pathWrap" hidden>
+    <input id="pathInput" type="text" placeholder="输入模型文件绝对路径" aria-label="模型文件路径">
+    <button id="pathLoadBtn" type="button">加载</button>
+  </span>
+  <span class="spacer"></span>
+  <span class="segmented" role="group" aria-label="模式切换">
+    <button id="modePreview" type="button" aria-pressed="true">预览</button>
+    <button id="modeEdit" type="button" aria-pressed="false">编辑</button>
+  </span>
+  <button id="askAiBtn" type="button" title="把当前盘工作区信息发送到对话">询问 AI</button>
+  <span class="menu-wrap">
+    <button id="exportBtn" type="button" class="primary">导出 GLB</button>
+    <span id="exportMenu" hidden>
+      <button id="downloadGlbBtn" type="button">下载当前盘 GLB…</button>
+      <button id="savePathBtn" type="button">保存到路径…</button>
+    </span>
+  </span>
+  <span id="syncBadge" data-state="idle" role="status">未加载</span>
+</header>
+
+<div id="main">
+  <aside id="outliner" aria-label="盘大纲与渲染控制">
+    <div class="side-head">
+      <span>盘</span>
+      <span class="spacer"></span>
+      <button id="newPlateBtn" type="button" title="新建一个空盘">＋ 新建盘</button>
+    </div>
+    <div id="plateTree" role="tree" aria-label="盘与对象"></div>
+    <section id="renderControls" aria-label="渲染控制">
+      <h3>渲染控制</h3>
+      <div class="ctl"><label for="ctlKey">主光强度</label><input id="ctlKey" type="range" min="0" max="4" step="0.05" value="1.6"><output id="ctlKeyOut">1.6</output></div>
+      <div class="ctl"><label for="ctlAngle">主光方位</label><input id="ctlAngle" type="range" min="0" max="360" step="1" value="35"><output id="ctlAngleOut">35°</output></div>
+      <div class="ctl"><label for="ctlAmbient">环境光</label><input id="ctlAmbient" type="range" min="0" max="3" step="0.05" value="1.1"><output id="ctlAmbientOut">1.1</output></div>
+      <div class="ctl"><label for="ctlExposure">曝光</label><input id="ctlExposure" type="range" min="0.4" max="2" step="0.05" value="1"><output id="ctlExposureOut">1.0</output></div>
+      <div class="ctl"><label for="ctlFov">视场角</label><input id="ctlFov" type="range" min="20" max="90" step="1" value="50"><output id="ctlFovOut">50°</output></div>
+      <div class="ctl"><label for="ctlSpin">自动旋转</label><input id="ctlSpin" type="range" min="0" max="6" step="0.1" value="0"><output id="ctlSpinOut">0</output></div>
+      <div class="ctl-row">
+        <label>画质
+          <select id="ctlQuality" aria-label="渲染画质">
+            <option value="low">低</option>
+            <option value="mid" selected>中</option>
+            <option value="high">高</option>
+          </select>
+        </label>
+        <label>主题
+          <select id="ctlTheme" aria-label="主题">
+            <option value="auto" selected>跟随宿主</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+      </div>
+      <div class="ctl-row">
+        <label><input id="ctlGrid" type="checkbox" checked> 网格</label>
+        <label><input id="ctlWire" type="checkbox"> 线框</label>
+        <label><input id="ctlGizmo" type="checkbox" checked> 坐标球</label>
+      </div>
+      <div class="ctl-row">
+        <button id="ctlResetView" type="button">重置视图</button>
+        <button id="ctlResetRender" type="button">重置渲染</button>
+      </div>
+    </section>
+  </aside>
+
+  <div id="viewport">
+    <div id="canvasHost"></div>
+    <div id="gizmoHit" title="坐标球：点击轴切换视角" aria-label="坐标球视角控制" role="application" tabindex="0"></div>
+
+    <div id="viewBar" class="floatbar" role="toolbar" aria-label="视图控制">
+      <button id="fitBtn" type="button" title="适配视图 (F)">适配</button>
+      <button id="frontBtn" type="button">正视</button>
+      <button id="topBtn" type="button">顶视</button>
+      <button id="sideBtn" type="button">侧视</button>
+      <button id="isoBtn" type="button">等轴</button>
+      <span class="sep"></span>
+      <button id="upAxisBtn" type="button" aria-pressed="false" title="切换上方向轴">Y 向上</button>
+    </div>
+
+    <div id="editBar" class="floatbar" role="toolbar" aria-label="编辑工具" hidden>
+      <button id="moveBtn" type="button" aria-pressed="true" title="移动 (G)">移动</button>
+      <button id="rotateBtn" type="button" aria-pressed="false" title="旋转 (R)">旋转</button>
+      <button id="scaleBtn" type="button" aria-pressed="false" title="缩放 (S)">缩放</button>
+      <span class="sep"></span>
+      <button id="dupBtn" type="button" title="复制所选 (Ctrl+D)">复制</button>
+      <button id="resetSelBtn" type="button">重置所选</button>
+    </div>
+
+    <div id="emptyState">
+      <h2>在窗口中预览与编辑 3D 模型</h2>
+      <p class="muted">从桌面拖入模型文件、点击对话区的模型链接，或打开本地文件。<br>模型按“盘”组织；编辑模式下可移动、旋转、缩放、设置原点与复制，统一导出为 GLB。</p>
+      <div class="chips">
+        <span>GLB</span><span>glTF</span><span>OBJ</span><span>STL</span><span>PLY</span><span>FBX</span><span>3MF</span><span>DAE</span><span>.blend（需 Blender）</span>
+      </div>
+      <button id="emptyOpenBtn" type="button" class="primary">打开模型文件</button>
+    </div>
+
+    <div id="loadingOverlay" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <p id="loadingText">加载中…</p>
+    </div>
+
+    <div id="webglError" hidden>
+      <h2>无法初始化 WebGL</h2>
+      <p class="muted">请检查显卡驱动；远程桌面环境下可能不支持硬件加速。</p>
+    </div>
+
+    <div id="dropOverlay" hidden>松开以导入模型文件</div>
+
+    <div id="importDialog" class="dialog" hidden>
+      <div class="card" role="dialog" aria-label="导入方式">
+        <strong>导入「<span id="importModelName"></span>」</strong>
+        <p class="muted" style="margin:0">选择并入当前盘，或为它新建一个盘。</p>
+        <button id="importMergeBtn" type="button" class="primary">并入当前盘</button>
+        <div class="row">
+          <input id="newPlateName" type="text" aria-label="新盘名称">
+          <button id="importNewBtn" type="button">新建盘并导入</button>
+        </div>
+        <div class="row"><button id="importCancelBtn" type="button">取消导入</button></div>
+      </div>
+    </div>
+
+    <div id="saveDialog" class="dialog" hidden>
+      <div class="card" role="dialog" aria-label="保存 GLB 到路径">
+        <strong>保存当前盘 GLB 到路径</strong>
+        <label for="savePathInput" class="muted">绝对路径（建议以 .glb 结尾）</label>
+        <input id="savePathInput" type="text">
+        <div class="row">
+          <button id="saveConfirmBtn" type="button" class="primary">保存</button>
+          <button id="saveCancelBtn" type="button">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toasts" aria-live="polite"></div>
+  </div>
+
+  <aside id="propsPanel" aria-label="属性表">
+    <section>
+      <h3>属性 <span id="pinBadge" hidden>已固定</span></h3>
+      <p id="noSelection" class="muted">在视图或左侧大纲中点击对象进行选择；选中后此表固定在页面右侧，拖动视角不会丢失选择。</p>
+      <div id="transformPanel" hidden>
+        <input id="propsName" type="text" aria-label="对象名称">
+        <span id="propsPlate" class="plate-chip"></span>
+        <div class="grid3" style="margin-top:8px">
+          <label>位置</label>
+          <input id="px" type="number" step="0.1" aria-label="位置 X">
+          <input id="py" type="number" step="0.1" aria-label="位置 Y">
+          <input id="pz" type="number" step="0.1" aria-label="位置 Z">
+          <label>旋转°</label>
+          <input id="rx" type="number" step="5" aria-label="旋转 X（度）">
+          <input id="ry" type="number" step="5" aria-label="旋转 Y（度）">
+          <input id="rz" type="number" step="5" aria-label="旋转 Z（度）">
+          <label>缩放</label>
+          <input id="sx" type="number" step="0.1" min="0.001" aria-label="缩放 X">
+          <input id="sy" type="number" step="0.1" min="0.001" aria-label="缩放 Y">
+          <input id="sz" type="number" step="0.1" min="0.001" aria-label="缩放 Z">
+        </div>
+        <div class="row" style="margin-top:6px">
+          <label class="row"><input id="uniformScale" type="checkbox" checked> 等比缩放</label>
+          <label class="row"><input id="propsVisible" type="checkbox" checked> 显示</label>
+        </div>
+        <h3 style="margin-top:10px">设置原点</h3>
+        <div class="origin-grid">
+          <button id="originGeometryBtn" type="button" title="原点移到包围盒几何中心">几何中心</button>
+          <button id="originBottomBtn" type="button" title="原点移到底面中心">底面中心</button>
+          <button id="originWorldBtn" type="button" title="原点移到世界原点">世界原点</button>
+        </div>
+        <h3 style="margin-top:10px">操作</h3>
+        <div class="btn-grid">
+          <button id="propsDupBtn" type="button">复制</button>
+          <button id="propsResetBtn" type="button">重置变换</button>
+          <button id="propsDeleteBtn" type="button" class="danger">删除</button>
+          <button id="propsDeselectBtn" type="button">取消选择</button>
+        </div>
+        <p id="propsStats" class="muted" style="font-size:12px;margin:8px 0 0"></p>
+      </div>
+    </section>
+    <section id="plateSummaryWrap">
+      <h3>当前盘</h3>
+      <div id="plateSummary" class="muted">暂无盘。导入第一个模型时会自动新建。</div>
+    </section>
+    <section id="aiBox" class="ai-box">
+      <h3>AI 建模</h3>
+      <div class="row"><input id="aiPromptInput" type="text" placeholder="描述模型或修改要求，如：一个带底座的茶杯" aria-label="AI 建模描述" /></div>
+      <div class="row">
+        <button id="aiCreateBtn" type="button" title="把描述发送到对话，由 Agent 调用 agent_create_model 生成">AI 生成模型</button>
+        <button id="aiModifyBtn" type="button" title="把当前盘上下文与要求发送到对话，由 Agent 调用 agent_modify_model 修改">AI 修改当前盘</button>
+      </div>
+      <p class="muted">基于参数化图元（立方体 / 圆角盒 / 球 / 圆柱 / 圆锥 / 棱锥 / 环 / 胶囊 / 平面 / 车旋体 / 管道）组合建模，生成后可继续编辑并导出 GLB。</p>
+    </section>
+  </aside>
+</div>
+
+<div id="ctxMenu" hidden role="menu"></div>
+
+<footer>
+  <span id="statusText" role="status">正在连接宿主…</span>
+  <span id="statsText"></span>
+</footer>
+
+<script>/* APP_SCRIPT */</script>
+</body>
+</html>

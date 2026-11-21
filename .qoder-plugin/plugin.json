@@ -1,0 +1,17 @@
+{
+  "name": "model-studio",
+  "displayName": "建模工作台",
+  "version": "0.3.2",
+  "description": "在 Qoder 窗口中预览多种格式的 3D 模型，进行移动/旋转/缩放等简单编辑，统一导出为 GLB；支持 AI 参数化图元建模与修改；内置 Blender 多版本适配，可配置接入其他建模软件。",
+  "author": {
+    "name": "Qoder User"
+  },
+  "keywords": [
+    "qoder-plugin",
+    "3d",
+    "modeling",
+    "blender",
+    "gltf",
+    "mcp-app"
+  ]
+}
