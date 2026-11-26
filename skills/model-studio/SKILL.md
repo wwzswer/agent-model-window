@@ -21,10 +21,11 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
    - 每次 `agent_create_model` / `agent_modify_model` / `export_model` 之后，回复里必须附一个上述链接；不要让用户手输绝对路径，也不要让用户自己去菜单里找入口。
    - **不要用普通 `file://` 链接指向模型文件**：点击只会走系统打开方式，不会进工作台。要么 `open_model { path }` + `open_viewer {}`，要么上面的 `/open/` 深链接。
    - 用户拖拽桌面文件到工作台同样可导入，无需 Agent 介入。
+   - **对话里的文件芯片点不进工作台**：那是宿主自己渲染的链接，插件无法挂钩子。用户说“点了文件没反应/能不能点文件就打开工作台”时，不要重复发深链接假装能修好它，改给第 11 条的外部入口（CLI / Windows“打开方式”）。
 3. **了解用户编辑**：页面把盘工作区（每个盘的对象及位置/旋转角度/缩放/可见性）通过 `update_workspace_state` 同步到服务器。需要完整场景时调用 `get_workspace {}`；需要某个模型被哪些盘引用及其变换时调用 `get_model_info { modelId? }`（读 `references`）。不要凭空假设变换数值。
 4. **统一导出**：调用 `export_model { plateId?, modelId?, outputPath? }` 把一个盘统一导出为 GLB。
    - `plateId` 省略时用当前盘；传 `modelId` 时导出该模型所在的盘。
-   - 导出依赖页面自动同步的 GLB 缓存（导入后与每次编辑后约 1–3 秒内自动上传）。
+   - 导出依赖页面自动同步的 GLB 缓存——**只有盘里含外部模型时才需要**。纯 spec 盘由服务端内核按 spec + 对象变换直接组装，页面在不在场都能导出（结果文本会写“来自服务端几何内核”）。
    - 若返回“没有可用的 GLB 导出缓存”，先调用 `open_model` 或 `open_viewer` 打开视图，稍候重试；不要反复立即重试。
    - `outputPath` 省略时保存到首个对象源文件同目录、以盘名命名；服务器不会覆盖源文件（自动改名）。
 5. **格式转换能力诊断**：`list_adapters {}` 查看 Blender 是否配置、检测到的版本、自定义适配器可用性。
@@ -32,7 +33,7 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
 7. **AI 建模（生成新模型）**：用户要求“做一个 / 生成一个”由基本体组合的模型（桌子、杯子、机器人、支架、场景摆件等）时，调用 `agent_create_model { name?, description?, parts[] }`。
    - 坐标系约定：Y-up、单位米、地面在 y=0；每个图元的 `position` 是其几何中心。
    - 规则图元与 `params`：`box {width,height,depth[,segments|segmentsX/Y/Z]}`、`rounded_box {width,height,depth[,radius,segments]}`（radius<最小边长一半）、`sphere {radius[,segments]}`、`cylinder {radius|radiusTop/radiusBottom,height[,segments]}`、`cone {radius,height[,segments]}`、`pyramid {radius,height}`（四棱锥，底面边与轴对齐）、`torus {radius,tube[,segments,segmentsTubular]}`、`capsule {radius,height[,segments]}`（height 为总高，含两端半球）、`plane {width,height[,segments]}`（水平放置于 XZ 面）。
-   - 工程曲面图元与 `params`：`lathe {points:[[半径,y],…2–64][,segments]}`（轮廓绕 Y 轴回转成回转体，适合杯/瓶/罐/塔；端点半径 0 自动封闭）、`tube {points:[[x,y,z],…2–64][,radius,tubularSegments,radialSegments,closed:1]}`（沿路径圆截面扫掠，适合把手/扶手/管线）、`sweep {points:[[x,y,z],…2–64], profile:{shape:"circle"[,radius]|"rect"{width,height}|"polygon"{points:[[x,y],…3–32]}[, twistDeg, tubularSegments, closed:1]}`（沿路径扫掠任意截面，适合型材/工字梁/异形扶手；截面随 Frenet 帧朝向，twistDeg 沿程扭转）、`extrude {points:[[x,z],…3–64], depth[, bevel:1, bevelSize, bevelSegments]}`（平面轮廓沿 +Y 拉伸成实体，bevel 倒角，适合法兰/垫片/L 支架/带孔板轮廓）、`heightfield {width,depth, heights:[[…],2–33 行×2–33 列]}`（逐格给 y 高度的网格曲面，适合地形/波纹板/弧面薄壳；行沿 +Z、列沿 +X，中心在原点）。曲面图元的 points 相对图元 position。
+   - 工程曲面图元与 `params`：`lathe {points:[[半径,y],…2–64][,segments]}`（轮廓绕 Y 轴回转成回转体，适合杯/瓶/罐/塔；端点半径 0 自动封闭）、`tube {points:[[x,y,z],…2–64][,radius,tubularSegments,radialSegments,closed:1]}`（沿路径圆截面扫掠，适合把手/扶手/管线）、`sweep {points:[[x,y,z],…2–64], profile:{shape:"circle"[,radius]|"rect"{width,height}|"polygon"{points:[[x,y],…3–32]}[, twistDeg, tubularSegments, closed:1]}`（沿路径扫掠任意截面，适合型材/工字梁/异形扶手；截面随 Frenet 帧朝向，twistDeg 沿程扭转）、`extrude {points:[[x,z],…3–64], depth[, bevel:1, bevelSize, bevelSegments]}`（平面轮廓沿 +Y 拉伸成实体，bevel 倒角，适合法兰/垫片/L 支架/带孔板轮廓）、`heightfield {width,depth, heights:[[…],2–33 行×2–33 列]}`（逐格给 y 高度的网格曲面，适合地形/波纹板/弧面薄壳；行沿 +Z、列沿 +X，中心在原点）、`loft {profile:[[x,z],…3–64], sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}`（一份闭合平面轮廓按多个水平截面层逐层缩放/平移/扭转后放样成实体，适合泪滴/鼠标壳/机头/渐缩罩这类“轮廓不变但沿程变形”的形状：`sx`/`sz` 分别控 X/Z 方向缩放，可以“尾部锚住、头部快速收尖”；某层 `scale:0` 塌成一个顶点，就是锥/泪滴尖；`profile` 旋向无所谓，内核按有向体积自动翻法线）。曲面图元的 points 相对图元 position。
    - 精度：segments 默认 球 48 / 圆柱·圆锥 32 / 环面 24×64 / 回转 48 / 管道 64×16 / 扫掠 32×截面（上限 256）；圆润度不足时显式加大 segments，细小特征拆成多图元组合。
    - 每个 part 必有 `primitive`；`id` 省略自动编号；可选 `name`、`position [x,y,z]`、`rotationDeg [x,y,z]`、`scale [x,y,z]`、`color "#rrggbb"`、`metalness`、`roughness`、`visible`。每模型 ≤200 图元。
    - 组合技巧：先想整体尺寸，再按“底座→主体→细节”逐块摆放，保证接触面 y 值衔接（如桌面 y=0.72、厚 0.06 则桌腿中心 y≈0.35）。回转体优先 lathe，变截面路径用 sweep，平面轮廓实体用 extrude，起伏表面用 heightfield。
@@ -52,6 +53,12 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
    - **门（gates）家族**：`dimension {x|y|z:{value,tol}}`（包围盒尺寸，米）、`ground {tol}`（只拦"穿地"：最低点 < −tol 才失败，悬空不报错；要卡贴地精度就看 `measured` 数值）、`silhouette {名称:{view,tol,points:[{at,width}]≤64}}`（指定视图下某位置的轮廓宽度，防"变方块"）、`clearance {mode,minPairs,minMm3,allow≤120,maxTriPairs}`（部件两两相交体积，默认按 `overlapMm3` 阈值而非 AABB 粗判）、`parts {count,ids}`、`custom {名称:{path,op,value,tol}}`（任意数值字段比对）。≤8 个门。
    - 判读要点：`ground` 负值＝扎进地面，`silhouette` 宽度恒定＝轮廓被矩形底板撑坏，`clearance` 里 `mode:"aabb-capped"`＝三角对超预算退化为 AABB 粗判（可缩小 `allow` 白名单或加 `budget`）。发现这些问题应改 spec（换图元/加特征），而不是只调数值。
 10. **快照与回退**：每次写回 spec（create/modify/optimize apply）前服务器自动快照，环形保留最近 8 条。`snapshot_model {}` 手动加一条并写理由；`revert_model { index }` 回到旧版（`index` 从 `snapshots` 列表取，1＝最旧），`list:true` 只看列表不回退。`summary` 里的 `revision` / `snapshots` 用于确认版本。改坏了不要重新生成整模型，先回退。
+
+11. **会话外部控制面板（对话之外的入口）**：MCP 进程在 `127.0.0.1` 监听一个本地 HTTP 端点，端口与令牌记录在 `~/.qoder-model-studio/panel.json`。
+    - 想知道它是否可用、端口、命令行路径：`panel_status {}`（结果含 `cli` 指向 `scripts/open-in-workbench.mjs`）。
+    - 用户想在 Qoder 外面点开模型文件（资源管理器、别的软件、脚本）：给命令 `node "<cli>" "文件的绝对路径"`——它把文件注册进服务器并排队，已打开的工作台会在约 2.5 秒内自动导入；命令还会尝试用 `qoder-cn://` 深链接调起视图（`--no-launch` 可关掉这一步）。
+    - 想让它成为 Windows 右键“打开方式”里的候选：先 `node "<cli>" --register` 看计划，用户确认后再加 `--yes` 执行；只写 HKCU 的 `OpenWithProgids`，不改任何扩展名的默认打开程序，`--unregister --yes` 精确撤销。写注册表属于用户机器上的改动，**必须先拿到明确同意**，不要替用户决定。
+    - 视图没打开时请求留在服务器队列里，下次打开工作台自动加载；面板起不来（端口被占/设置里关了）时 `panel_status` 会说明原因，此时回退到 `open_model` + `open_viewer`。
 
 ## 页面能力（向用户介绍时使用）
 

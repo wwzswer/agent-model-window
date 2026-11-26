@@ -5,7 +5,7 @@ import * as THREE from "three"
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js"
 
 export const SPEC_PRIMITIVES = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid",
-  "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield"]
+  "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield", "loft"]
 
 const segInt = (v, d, min) => {
   const n = Math.round(Number(v ?? d))
@@ -163,6 +163,77 @@ export function specGeometry(primitive, p) {
       }
       const geometry = new THREE.BufferGeometry()
       geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3))
+      geometry.setIndex(idx)
+      geometry.computeVertexNormals()
+      return geometry
+    }
+    case "loft": {
+      const prof = (Array.isArray(p.profile) ? p.profile : [])
+        .slice(0, 64).map(q => [Number(q[0]) || 0, Number(q[1]) || 0])
+      if (prof.length < 3) throw new Error("loft 截面至少需要 3 个点。")
+      const secs = (Array.isArray(p.sections) ? p.sections : [])
+        .filter(s => s && Number.isFinite(Number(s.y))).slice(0, 24)
+      if (secs.length < 2) throw new Error("loft 至少需要 2 个截面层（sections）。")
+      const N = prof.length
+      const pos = []
+      const rings = []
+      for (const s of secs) {
+        const y = Number(s.y)
+        const cx = Number(s.cx ?? 0), cz = Number(s.cz ?? 0)
+        const base = Number(s.scale ?? 1)
+        const ax = Number(s.sx ?? base), az = Number(s.sz ?? base)
+        if (!Number.isFinite(ax) || !Number.isFinite(az) || Math.abs(ax) < 1e-6 || Math.abs(az) < 1e-6) {
+          pos.push(cx, y, cz)
+          rings.push({ point: pos.length / 3 - 1 })
+          continue
+        }
+        const tw = (Number(s.twistDeg ?? 0) * Math.PI) / 180
+        const cos = Math.cos(tw), sin = Math.sin(tw)
+        const start = pos.length / 3
+        for (let i = 0; i < N; i++) {
+          const x = prof[i][0] * ax, z = prof[i][1] * az
+          pos.push(cx + x * cos - z * sin, y, cz + x * sin + z * cos)
+        }
+        rings.push({ start, n: N })
+      }
+      const idx = []
+      for (let k = 0; k + 1 < rings.length; k++) {
+        const a = rings[k], b = rings[k + 1]
+        if (a.point !== undefined) {
+          if (b.point !== undefined) continue
+          for (let i = 0; i < b.n; i++) idx.push(a.point, b.start + i, b.start + ((i + 1) % b.n))
+        } else if (b.point !== undefined) {
+          for (let i = 0; i < a.n; i++) idx.push(a.start + i, b.point, a.start + ((i + 1) % a.n))
+        } else {
+          for (let i = 0; i < N; i++) {
+            const j = (i + 1) % N
+            idx.push(a.start + i, a.start + j, b.start + j, a.start + i, b.start + j, b.start + i)
+          }
+        }
+      }
+      for (const [r, flip] of [[rings[0], true], [rings[rings.length - 1], false]]) {
+        if (r.point !== undefined) continue
+        let sx = 0, sy = 0, sz = 0
+        for (let i = 0; i < r.n; i++) { const o = (r.start + i) * 3; sx += pos[o]; sy += pos[o + 1]; sz += pos[o + 2] }
+        pos.push(sx / r.n, sy / r.n, sz / r.n)
+        const c = pos.length / 3 - 1
+        for (let i = 0; i < r.n; i++) {
+          const j = (i + 1) % r.n
+          if (flip) idx.push(c, r.start + j, r.start + i)
+          else idx.push(c, r.start + i, r.start + j)
+        }
+      }
+      // 有向体积定朝向：截面给点序的旋向不可预知，负体积就整体翻三角，保证法线朝外。
+      let vol = 0
+      for (let i = 0; i < idx.length; i += 3) {
+        const A = idx[i] * 3, B = idx[i + 1] * 3, C = idx[i + 2] * 3
+        vol += (pos[A] * (pos[B + 1] * pos[C + 2] - pos[B + 2] * pos[C + 1])
+          + pos[A + 1] * (pos[B + 2] * pos[C] - pos[B] * pos[C + 2])
+          + pos[A + 2] * (pos[B] * pos[C + 1] - pos[B + 1] * pos[C])) / 6
+      }
+      if (vol < 0) for (let i = 0; i < idx.length; i += 3) { const t = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = t }
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3))
       geometry.setIndex(idx)
       geometry.computeVertexNormals()
       return geometry

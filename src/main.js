@@ -8,7 +8,10 @@ import { parseModel, computeStats } from "./loaders.js"
 
 const $ = id => document.getElementById(id)
 const PICK_EXTENSIONS = ["glb", "gltf", "obj", "stl", "ply", "fbx", "3mf", "dae", "blend", "step", "stp", "iges", "igs", "abc", "usd", "x3d"]
-const CHUNK_RAW = 1_500_000
+// 宿主对 MCP App 工具入参有 1 MiB 硬校验（按 JSON.stringify(arguments) 的字节数计），超限直接报“工具参数过大”。
+// base64 每 3 字节膨胀成 4，所以 700 KB 原始数据约等于 0.89 MiB 参数，余量给 plateId/uploadId 等字段。
+const CHUNK_RAW_LIMIT = 700_000
+let chunkRaw = CHUNK_RAW_LIMIT
 const uid = () => (globalThis.crypto?.randomUUID ? crypto.randomUUID() : `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
 
 const state = {
@@ -51,6 +54,33 @@ function base64ToBytes(b64) {
   const out = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
   return out
+}
+// 分块推送字节。块大小由宿主上限反推，但上限是宿主内部常量、版本可能变，所以被拒时把块折半重发；
+// 服务端在分块数变化时重置该上传会话，所以同一个 uploadId 可以安全地换块大小重来。
+async function pushChunks(toolName, makeArgs, bytes, onProgress) {
+  for (let retry = 0; ; retry++) {
+    try {
+      const total = Math.max(1, Math.ceil(bytes.length / chunkRaw))
+      for (let i = 0; i < total; i++) {
+        onProgress?.(i + 1, total)
+        toolResult(await host.callTool(toolName, makeArgs({
+          index: i,
+          total,
+          data: bytesToBase64(bytes.subarray(i * chunkRaw, (i + 1) * chunkRaw)),
+          final: i === total - 1,
+        })))
+      }
+      return
+    } catch (error) {
+      const msg = String(error?.message ?? error)
+      if (retry < 4 && chunkRaw > 64_000 && /过大|too large/i.test(msg)) {
+        chunkRaw = Math.max(64_000, Math.floor(chunkRaw / 2))
+        setStatus(`宿主入参上限更小，块降为 ${(chunkRaw / 1024).toFixed(0)} KB 重传…`)
+        continue
+      }
+      throw error
+    }
+  }
 }
 function setStatus(text, error = false) {
   const el = $("statusText")
@@ -180,6 +210,20 @@ async function syncFromServer() {
   } catch (error) {
     setStatus(error?.message || String(error), true)
   }
+}
+
+// 外部控制面板（CLI / 资源管理器“打开方式”）排队的打开请求：视图在场就取走并导入，
+// 视图没在场时请求留在服务器队列里，下次打开工作台自动加载。
+let openPollTimer = null
+function startOpenRequestPoll() {
+  if (openPollTimer) return
+  openPollTimer = setInterval(async () => {
+    if (!host.ready || dialogBusy || state.exporting) return
+    try {
+      const data = toolResult(await host.callTool("pending_open_requests", {}))
+      for (const request of data.requests ?? []) void loadLocalFile(request.path)
+    } catch { /* 服务器版本没有该工具或瞬时失败：下一轮再试，不打扰用户 */ }
+  }, 2500)
 }
 
 // ---------- 三维场景 ----------
@@ -620,15 +664,10 @@ async function uploadDroppedFiles(files) {
     let done = 0
     for (const file of usable) {
       const bytes = new Uint8Array(await file.arrayBuffer())
-      const total = Math.max(1, Math.ceil(bytes.length / CHUNK_RAW))
-      for (let i = 0; i < total; i++) {
-        $("loadingText").textContent = `上传 ${file.name}（${done + 1}/${usable.length}）块 ${i + 1}/${total}`
-        toolResult(await host.callTool("upload_import_chunk", {
-          uploadId, fileName: file.name, index: i, total,
-          data: bytesToBase64(bytes.subarray(i * CHUNK_RAW, (i + 1) * CHUNK_RAW)),
-          final: i === total - 1,
-        }))
-      }
+      await pushChunks("upload_import_chunk",
+        part => ({ uploadId, fileName: file.name, ...part }),
+        bytes,
+        (i, total) => { $("loadingText").textContent = `上传 ${file.name}（${done + 1}/${usable.length}）块 ${i}/${total}` })
       done++
     }
     $("loadingText").textContent = "注册模型（必要时调用建模软件转换）…"
@@ -1271,14 +1310,11 @@ async function buildPlateGlb(plate) {
   return new Uint8Array(result)
 }
 async function uploadExport(bytes, plateId, uploadId) {
-  const total = Math.max(1, Math.ceil(bytes.length / CHUNK_RAW))
-  for (let i = 0; i < total; i++) {
-    const slice = bytes.subarray(i * CHUNK_RAW, (i + 1) * CHUNK_RAW)
-    toolResult(await host.callTool("upload_export_chunk", {
-      plateId, uploadId, index: i, total,
-      data: bytesToBase64(slice), final: i === total - 1,
-    }))
-  }
+  await pushChunks("upload_export_chunk", part => ({ plateId, uploadId, ...part }), bytes)
+}
+// 纯 spec 盘的 GLB 由服务端内核按 spec + 对象变换组装，页面不必把字节搬回服务器（入参只有 1 MiB）。
+function isSpecOnlyPlate(plate) {
+  return plate.items.length > 0 && plate.items.every(i => state.templates.get(i.modelId)?.manifest?.format === "spec")
 }
 async function exportAndCache() {
   const plate = activePlate()
@@ -1287,10 +1323,17 @@ async function exportAndCache() {
   setSync("syncing")
   try {
     await syncWorkspace()
+    if (isSpecOnlyPlate(plate)) {
+      state.dirty = false
+      setSync("synced")
+      setStatus(`盘「${plate.name}」改动已同步，导出由服务端内核组装。`)
+      return
+    }
     const bytes = await buildPlateGlb(plate)
     await uploadExport(bytes, plate.id, `${plate.id}-${Date.now()}`)
     state.dirty = false
     setSync("synced")
+    setStatus(`盘「${plate.name}」已同步（GLB ${fmtSize(bytes.length)}，块 ${Math.ceil(bytes.length / chunkRaw)} × ${(chunkRaw / 1024).toFixed(0)} KB）。`)
   } catch (error) {
     setSync("error")
     setStatus("GLB 导出同步失败：" + (error?.message || error), true)
@@ -1327,8 +1370,9 @@ async function saveToPath() {
   try {
     setStatus("正在导出并写入文件…")
     setSync("syncing")
-    const bytes = await buildPlateGlb(plate)
-    await uploadExport(bytes, plate.id, `${plate.id}-save-${Date.now()}`)
+    await syncWorkspace()
+    // 全 spec 的盘由服务端内核按 spec + 对象变换直接组装，不必把字节回传（宿主入参有 1 MiB 上限）。
+    if (!isSpecOnlyPlate(plate)) await uploadExport(await buildPlateGlb(plate), plate.id, `${plate.id}-save-${Date.now()}`)
     const data = toolResult(await host.callTool("save_export_to_path", { plateId: plate.id, outputPath }))
     state.dirty = false
     setSync("synced")
@@ -1623,6 +1667,7 @@ async function main() {
     await syncFromServer()
     if (!state.workspace.plates.length) setStatus("已连接。拖入模型文件、点击对话区模型链接或打开本地文件开始。")
     if (pendingRoute !== null) { const route = pendingRoute; pendingRoute = null; applyRoute(route) }
+    startOpenRequestPoll()
   } catch (error) {
     setStatus(error?.message || String(error), true)
   }

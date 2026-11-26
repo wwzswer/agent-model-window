@@ -18,7 +18,12 @@ function check(name, ok, detail = "") {
 }
 
 // ---- JSON-RPC 客户端 ----
-const child = spawn(process.execPath, [path.join(root, "server.mjs")], { stdio: ["pipe", "pipe", "pipe"] })
+// 面板记录指向临时目录：测试进程不去抢写真实 ~/.qoder-model-studio/panel.json，
+// 端口 -1 = 直接向系统要临时端口，避免和已装的 Qoder MCP 进程抢候选端口。
+const child = spawn(process.execPath, [path.join(root, "server.mjs")], {
+  stdio: ["pipe", "pipe", "pipe"],
+  env: { ...process.env, MODEL_STUDIO_PANEL_FILE: path.join(tmp, "panel.json"), MODEL_STUDIO_PANEL_PORT: "-1" },
+})
 let buffer = ""
 const pending = new Map()
 let seq = 0
@@ -62,7 +67,7 @@ try {
 
   const toolList = (await rpc("tools/list", {})).result.tools
   const names = toolList.map(t => t.name)
-  check("工具齐全", ["open_model", "export_model", "list_models", "get_workspace", "get_model_info", "list_adapters", "agent_create_model", "agent_modify_model", "open_viewer", "load_local_file", "upload_import_chunk", "commit_import", "update_workspace_state", "upload_export_chunk", "save_export_to_path", "settings_read", "settings_update", "inspect_model", "check_gates", "optimize_params", "snapshot_model", "revert_model", "save_model_glb"].every(n => names.includes(n)))
+  check("工具齐全", ["open_model", "export_model", "list_models", "get_workspace", "get_model_info", "list_adapters", "agent_create_model", "agent_modify_model", "open_viewer", "load_local_file", "upload_import_chunk", "commit_import", "update_workspace_state", "upload_export_chunk", "save_export_to_path", "settings_read", "settings_update", "inspect_model", "check_gates", "optimize_params", "snapshot_model", "revert_model", "save_model_glb", "panel_status", "pending_open_requests"].every(n => names.includes(n)))
   const openViewer = toolList.find(t => t.name === "open_viewer")
   check("入口声明 global+thread", JSON.stringify(openViewer._meta["qoder/ui"].entrypoints) === JSON.stringify([{ type: "global" }, { type: "thread" }]))
   check("open_viewer 对 Agent 可见", !openViewer._meta.ui.visibility && Boolean(openViewer._meta.ui.resourceUri))
@@ -133,6 +138,12 @@ try {
   await call("upload_import_chunk", { uploadId: "smoke-missing", fileName: "x.stl", index: 0, total: 2, data: stl.subarray(0, dropMid).toString("base64"), final: false })
   const missingChunk = await call("upload_import_chunk", { uploadId: "smoke-missing", fileName: "x.stl", index: 1, total: 2, data: "", final: true })
   check("缺块提交被拒绝", missingChunk.isError === true)
+  // 折半重传：块数变化时服务端重置该文件，之前的半块作废
+  await call("upload_import_chunk", { uploadId: "smoke-shrink", fileName: "a.stl", index: 0, total: 4, data: stl.subarray(0, 32).toString("base64"), final: false })
+  const shrinkUp = await call("upload_import_chunk", { uploadId: "smoke-shrink", fileName: "a.stl", index: 0, total: 1, data: stl.toString("base64"), final: true })
+  check("导入折半重传重置分块数", shrinkUp.structuredContent?.complete === true && shrinkUp.structuredContent?.sizeBytes === stl.length, JSON.stringify(shrinkUp.structuredContent ?? "").slice(0, 90))
+  const shrinkCommit = await call("commit_import", { uploadId: "smoke-shrink", mainFile: "a.stl" })
+  check("重置后仍可提交", !shrinkCommit.isError)
 
   // ---- 盘工作区同步 ----
   const plateId = "plate-1"
@@ -164,6 +175,11 @@ try {
   await call("upload_export_chunk", { plateId, uploadId: "smoke-1", index: 0, total: 2, data: glb.subarray(0, mid).toString("base64"), final: false })
   const finalUp = await call("upload_export_chunk", { plateId, uploadId: "smoke-1", index: 1, total: 2, data: glb.subarray(mid).toString("base64"), final: true })
   check("分块上传组装", finalUp.structuredContent?.complete === true && finalUp.structuredContent?.sizeBytes === glb.length)
+
+  // 页面被宿主拒入参后会折半块重传，同一个 uploadId 的块数随之变化：服务端应重置会话而不是报错
+  await call("upload_export_chunk", { plateId, uploadId: "smoke-2", index: 0, total: 3, data: glb.subarray(0, 64).toString("base64"), final: false })
+  const shrink = await call("upload_export_chunk", { plateId, uploadId: "smoke-2", index: 0, total: 1, data: glb.toString("base64"), final: true })
+  check("折半重传重置分块数", shrink.structuredContent?.complete === true && shrink.structuredContent?.sizeBytes === glb.length, JSON.stringify(shrink.structuredContent ?? shrink.content?.[0]?.text ?? "").slice(0, 90))
 
   const outPath = path.join(tmp, "exported.glb")
   const exported = await call("export_model", { plateId, outputPath: outPath })
@@ -374,6 +390,37 @@ try {
   const directBytes = existsSync(directExport.structuredContent?.path ?? "") ? await readFile(directExport.structuredContent.path) : null
   check("纯 spec 盘免页面导出", !directExport.isError && directExport.structuredContent?.via === "geometry-kernel" && directBytes?.subarray(0, 4).toString() === "glTF")
   await call("update_workspace_state", { workspace })
+
+  // ---- 会话外部控制面板（真实 HTTP 往返）----
+  const panelInfo = await call("panel_status", {})
+  check("panel_status 报告面板可用", panelInfo.structuredContent?.panel?.ok === true, JSON.stringify(panelInfo.structuredContent?.panel ?? {}).slice(0, 160))
+  const panelRecord = JSON.parse(await readFile(path.join(tmp, "panel.json"), "utf8"))
+  check("panel.json 落在指定文件", panelRecord.pid === child.pid && panelRecord.port > 0 && panelRecord.host === "127.0.0.1" && panelRecord.token.length === 32)
+  const base = `http://127.0.0.1:${panelRecord.port}`
+  check("面板无令牌被拒", (await fetch(`${base}/status`)).status === 401)
+  check("面板错令牌被拒", (await fetch(`${base}/status?token=deadbeefdeadbeefdeadbeefdeadbeef`)).status === 401)
+  const panelStatus = await (await fetch(`${base}/status?token=${panelRecord.token}`)).json()
+  check("面板 /status 回工作区", panelStatus.ok === true && panelStatus.plates >= 1 && typeof panelStatus.models === "number")
+  const panelOpened = await (await fetch(`${base}/open?token=${panelRecord.token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: glbOut }),
+  })).json()
+  check("面板 /open 注册并入队", panelOpened.ok === true && Boolean(panelOpened.modelId) && panelOpened.queued >= 1, JSON.stringify(panelOpened).slice(0, 160))
+  const drained = await call("pending_open_requests", {})
+  check("视图取走外部请求", drained.structuredContent?.requests?.some(r => r.path === glbOut))
+  check("队列取走即清空", (await call("pending_open_requests", {})).structuredContent?.requests?.length === 0)
+  const badOpen = await (await fetch(`${base}/open?token=${panelRecord.token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: path.join(root, "README.md") }),
+  })).json()
+  check("面板拒绝不支持的格式", badOpen.ok === false && /不支持/.test(badOpen.error ?? ""))
+  // 端口语义（panelPort=0 的约定）：默认应落在候选端口，显式端口照抄，负数才要临时端口
+  process.env.MODEL_STUDIO_PANEL_FILE = path.join(tmp, "panel-direct.json")
+  const { startPanel } = await import("../lib/panel.mjs")
+  const direct = await startPanel({ version: "smoke", onOpen: async () => ({}) })
+  check("面板默认使用候选端口", [37621, 37622, 37623, 37624].includes(direct.port), `实际 ${direct.port}${direct.error ? " / " + direct.error : ""}`)
+  const pinned = await startPanel({ version: "smoke", port: 45678, onOpen: async () => ({}) })
+  check("面板可钉住指定端口", pinned.ok === true && pinned.port === 45678, `实际 ${pinned.port}`)
+  const ephemeral = await startPanel({ version: "smoke", port: -1, onOpen: async () => ({}) })
+  check("面板负数端口走临时端口", ephemeral.ok === true && ![37621, 37622, 37623, 37624, 45678].includes(ephemeral.port), `实际 ${ephemeral.port}`)
 
   // ---- 错误路径 ----
   const missing = await call("open_model", { path: path.join(tmp, "nope.glb") })

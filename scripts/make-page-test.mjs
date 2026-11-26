@@ -6,27 +6,63 @@ import { fileURLToPath } from "node:url"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
-// ---- 构造一个立方体 GLB ----
-const positions = new Float32Array([
-  -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
-  -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
-])
-const indices = new Uint16Array([
-  0, 1, 2, 0, 2, 3, 5, 4, 7, 5, 7, 6, 4, 0, 3, 4, 3, 7,
-  1, 5, 6, 1, 6, 2, 4, 5, 1, 4, 1, 0, 3, 2, 6, 3, 6, 7,
-])
-const bin = Buffer.concat([Buffer.from(indices.buffer), Buffer.from(positions.buffer)])
+// ---- 构造测试网格 GLB ----
+// 默认 8 顶点立方体；PAGE_TEST_GRID=N（≤250）生成 N×N 起伏网格，重导出约 1 MB，用来压测分块与宿主入参上限。
+const GRID = Math.max(0, Number(process.env.PAGE_TEST_GRID || 0))
+let positions
+let indices
+if (GRID > 1) {
+  const verts = GRID + 1
+  positions = new Float32Array(verts * verts * 3)
+  let p = 0
+  for (let z = 0; z < verts; z++) {
+    for (let x = 0; x < verts; x++) {
+      positions[p++] = x / GRID - 0.5
+      positions[p++] = 0.05 * Math.sin((x / GRID) * Math.PI * 4) * Math.cos((z / GRID) * Math.PI * 4)
+      positions[p++] = z / GRID - 0.5
+    }
+  }
+  indices = new Uint16Array(GRID * GRID * 6)
+  let q = 0
+  for (let z = 0; z < GRID; z++) {
+    for (let x = 0; x < GRID; x++) {
+      const a = z * verts + x
+      indices[q++] = a; indices[q++] = a + 1; indices[q++] = a + verts + 1
+      indices[q++] = a; indices[q++] = a + verts + 1; indices[q++] = a + verts
+    }
+  }
+} else {
+  positions = new Float32Array([
+    -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
+    -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
+  ])
+  indices = new Uint16Array([
+    0, 1, 2, 0, 2, 3, 5, 4, 7, 5, 7, 6, 4, 0, 3, 4, 3, 7,
+    1, 5, 6, 1, 6, 2, 4, 5, 1, 4, 1, 0, 3, 2, 6, 3, 6, 7,
+  ])
+}
+const posMin = [Infinity, Infinity, Infinity]
+const posMax = [-Infinity, -Infinity, -Infinity]
+for (let i = 0; i < positions.length; i++) {
+  const c = i % 3
+  if (positions[i] < posMin[c]) posMin[c] = positions[i]
+  if (positions[i] > posMax[c]) posMax[c] = positions[i]
+}
+// glTF 要求 4 字节对齐：索引段（Uint16）后补零再接 POSITION
+const indexBytes = indices.byteLength
+const indexPad = (4 - (indexBytes % 4)) % 4
+const bin = Buffer.concat([Buffer.from(indices.buffer), Buffer.alloc(indexPad), Buffer.from(positions.buffer)])
 const gltf = {
   asset: { version: "2.0" }, scene: 0,
-  scenes: [{ nodes: [0] }], nodes: [{ mesh: 0, name: "Cube" }],
+  scenes: [{ nodes: [0] }], nodes: [{ mesh: 0, name: GRID > 1 ? "Grid" : "Cube" }],
   meshes: [{ primitives: [{ attributes: { POSITION: 1 }, indices: 0 }] }],
   accessors: [
-    { bufferView: 0, componentType: 5123, count: 36, type: "SCALAR" },
-    { bufferView: 1, componentType: 5126, count: 8, type: "VEC3", min: [-0.5, -0.5, -0.5], max: [0.5, 0.5, 0.5] },
+    { bufferView: 0, componentType: 5123, count: indices.length, type: "SCALAR" },
+    { bufferView: 1, componentType: 5126, count: positions.length / 3, type: "VEC3", min: posMin, max: posMax },
   ],
   bufferViews: [
-    { buffer: 0, byteOffset: 0, byteLength: 72, target: 34963 },
-    { buffer: 0, byteOffset: 72, byteLength: 96, target: 34962 },
+    { buffer: 0, byteOffset: 0, byteLength: indexBytes, target: 34963 },
+    { buffer: 0, byteOffset: indexBytes + indexPad, byteLength: positions.byteLength, target: 34962 },
   ],
   buffers: [{ byteLength: bin.length }],
 }
@@ -41,12 +77,13 @@ glb.writeUInt32LE(jsonChunk.length, 12); glb.writeUInt32LE(0x4e4f534a, 16); json
 const binHeader = 20 + jsonChunk.length
 glb.writeUInt32LE(binChunk.length, binHeader); glb.writeUInt32LE(0x004e4942, binHeader + 4); binChunk.copy(glb, binHeader + 8)
 
+const meshName = GRID > 1 ? "grid" : "cube"
 const manifest = {
-  id: "test", name: "cube.glb", format: "glb", payload: "binary",
+  id: "test", name: `${meshName}.glb`, format: "glb", payload: "binary",
   sizeBytes: glb.length, chunkSize: 2097152, chunkCount: 1,
-  sourcePath: "C:/tmp/cube.glb", converted: false, converter: null,
+  sourcePath: `C:/tmp/${meshName}.glb`, converted: false, converter: null,
 }
-const manifest2 = { ...manifest, id: "test2", name: "cube2.glb", sourcePath: "C:/tmp/cube2.glb" }
+const manifest2 = { ...manifest, id: "test2", name: `${meshName}2.glb`, sourcePath: `C:/tmp/${meshName}2.glb` }
 
 // ---- AI 建模 spec 模型（高精度图元：rounded_box / lathe / tube / pyramid）----
 // 可选 argv[2]：从生成的 spec 文件加载模型（工厂等）；否则用默认茶杯套件
@@ -74,7 +111,6 @@ const harness = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>page-test harness</title></head>
 <body style="margin:0;font:12px monospace">
 <div id="log" style="height:90px;overflow:auto;background:#111;color:#8f8;padding:4px"></div>
-<iframe id="app" src="./viewer.injected.html" style="width:100%;height:640px;border:0"></iframe>
 <script>
 const CALLS = []; window.__calls = CALLS;
 // ?dl=<深链接 URL> 模拟宿主在 initialize 的 hostContext 里带上深链接（页面尚未 ready 时的排队路径）
@@ -82,10 +118,12 @@ window.__bootDeepLink = new URLSearchParams(location.search).get("dl") || "";
 window.__manifests = { test: ${JSON.stringify(manifest)}, test2: ${JSON.stringify(manifest2)}, spec1: ${JSON.stringify(manifestSpec)} };
 window.__specDoc = ${JSON.stringify(specDoc)};
 const GLB_B64 = "${glb.toString("base64")}";
-const frame = document.getElementById("app");
+// iframe 在监听器注册好之后再挂上：大 harness 的父页面脚本要解析几 MB，先加载子页面会丢掉 ui/initialize。
+const frame = document.createElement("iframe");
+frame.id = "app"; frame.src = "./viewer.injected.html"; frame.setAttribute("style", "width:100%;height:640px;border:0");
 const logEl = document.getElementById("log");
 function log(text) { const d = document.createElement("div"); d.textContent = text; logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight; }
-const MODELS = [{ id: "test", name: "cube.glb", format: "glb" }, { id: "test2", name: "cube2.glb", format: "glb" }, { id: "spec1", name: "AI 茶杯套件", format: "spec" }];
+const MODELS = [{ id: "test", name: "${meshName}.glb", format: "glb" }, { id: "test2", name: "${meshName}2.glb", format: "glb" }, { id: "spec1", name: "AI 茶杯套件", format: "spec" }];
 window.__pushModel = id => {
   frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: {
     structuredContent: { model: { id }, models: MODELS, activeModelId: id },
@@ -117,6 +155,11 @@ window.__pushContext = ctx => {
   frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/host-context-changed", params: ctx }, "*");
   log("pushed context");
 };
+// 宿主对 MCP App 工具入参有 1 MiB 硬校验（按 JSON.stringify(arguments) 字节数），照抄进 harness；
+// ?argcap=<字节> 可临时压低上限，用来验证页面的分块降半重传。
+const ARG_CAP = Number(new URLSearchParams(location.search).get("argcap")) || 1048576;
+window.__argCap = ARG_CAP;
+function overCap(args) { return new TextEncoder().encode(JSON.stringify(args)).length >= ARG_CAP }
 window.addEventListener("message", e => {
   if (e.source !== frame.contentWindow) return;
   const m = e.data; if (!m || m.jsonrpc !== "2.0") return;
@@ -139,9 +182,17 @@ window.addEventListener("message", e => {
       break;
     case "tools/call": {
       const n = m.params.name, a = m.params.arguments || {};
+      if (/^upload_(import|export)_chunk$/.test(n) && overCap(a)) {
+        window.__capRejects = (window.__capRejects || 0) + 1;
+        log("REJECT " + n + " 入参超宿主上限");
+        frame.contentWindow.postMessage({ jsonrpc: "2.0", id: m.id, error: { code: -32602, message: "MCP App 工具参数过大。" } }, "*");
+        return;
+      }
       if (n === "open_viewer") result = { content: [], structuredContent: { models: [], activeModelId: null, workspace: { plates: [], activePlateId: null } } };
+      else if (n === "pending_open_requests") result = { content: [], structuredContent: { requests: (window.__externalOpens || []).splice(0) } };
       else if (n === "load_local_file") result = { content: [], structuredContent: { model: { id: "test2" }, models: MODELS, activeModelId: "test2", workspace: { plates: [], activePlateId: null } } };
       else if (n === "upload_import_chunk") {
+        window.__chunkArgBytes = (window.__chunkArgBytes || []).concat(new TextEncoder().encode(JSON.stringify(a)).length);
         window.__importChunks = window.__importChunks || {};
         const key = a.uploadId + "/" + a.fileName;
         (window.__importChunks[key] = window.__importChunks[key] || []).push({ index: a.index, total: a.total, data: a.data, final: a.final });
@@ -173,10 +224,13 @@ window.addEventListener("message", e => {
   }
   frame.contentWindow.postMessage({ jsonrpc: "2.0", id: m.id, result }, "*");
 });
+document.body.appendChild(frame);
 </script>
 </body></html>`
 
-await writeFile(process.argv[3] ? path.resolve(process.argv[3]) : path.join(root, "build", "page-test.html"), harness)
+// 输出路径：argv[3] 或 PAGE_TEST_OUT（默认 build/page-test.html）
+const outPath = process.argv[3] ? path.resolve(process.argv[3]) : path.resolve(process.env.PAGE_TEST_OUT || path.join(root, "build", "page-test.html"))
+await writeFile(outPath, harness)
 // 确认注入产物存在
 await readFile(path.join(root, "build", "viewer.injected.html"))
-console.log("page-test.html written; cube GLB bytes:", glb.length)
+console.log(path.basename(outPath) + " written;", meshName + ".glb bytes:", glb.length, GRID > 1 ? `(网格 ${GRID}×${GRID}，压测分块)` : "")

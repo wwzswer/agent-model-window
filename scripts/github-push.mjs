@@ -7,7 +7,13 @@
 //   node scripts/github-push.mjs --dry-run                # 只比对差异，不写任何东西（无需 token）
 //   node scripts/github-push.mjs --owner u --repo r --branch main --message "..."
 //   node scripts/github-push.mjs --prune                  # 顺带删除远端有、本地不发布的文件（默认不删）
-import { readFileSync, statSync } from "node:fs"
+//   node scripts/github-push.mjs --no-tag --no-release    # 只推文件，不动 tag / Release
+//   node scripts/github-push.mjs --tag-only               # 不提交文件，只把版本号 tag/Release 补在当前分支提交上
+// 版本号默认一起发布：提交推上分支后，在同一个提交上打 v<version> 注解 tag，并建同名 Release；
+// 若本地已有 pack.mjs 产出的 model-studio-<version>.zip，会作为 Release 附件上传——uploads.github.com
+// 实测可达（和 raw.githubusercontent.com 不一样），失败也只降级为“有 Release 没附件”。
+// 全流程幂等：tag/Release/附件都已存在就逐条跳过，所以 --tag-only 可以反复跑补档。
+import { readFileSync, statSync, existsSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
@@ -23,9 +29,13 @@ const repo = arg("repo", "agent-model-window")
 const branch = arg("branch", "main")
 const dryRun = Boolean(arg("dry-run", false))
 const prune = Boolean(arg("prune", false))
+const noTag = Boolean(arg("no-tag", false))
+const noRelease = Boolean(arg("no-release", false))
 const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || (typeof arg("token", "") === "string" ? arg("token", "") : "")
 const version = JSON.parse(readFileSync(path.join(root, ".qoder-plugin", "plugin.json"), "utf8")).version
 const message = arg("message", `model-studio ${version}`) || `model-studio ${version}`
+const customTag = arg("tag-name", null)
+const tagName = typeof customTag === "string" && customTag ? customTag : `v${version}`
 const authorName = process.env.GIT_AUTHOR_NAME || arg("author", "wwzswer")
 const authorEmail = process.env.GIT_AUTHOR_EMAIL || (typeof arg("author", "") === "string" ? "" : "") || "wwzswer@163.com"
 const API = "https://api.github.com"
@@ -71,6 +81,14 @@ const remoteTree = await api("GET", `${API}/repos/${owner}/${repo}/git/trees/${c
 const remote = new Map(remoteTree.tree.filter(t => t.type === "blob").map(t => [t.path, t]))
 console.log(`远端 ${branch} @ ${commitSha.slice(0, 7)}（${remote.size} 个文件）`)
 
+// 只补版本号：不读本地文件、不产生提交，把 tag / Release 打在分支当前提交上。
+// 用于“文件早就推了、tag 忘了发”这类补档，也用于确认 tag 名与 zip 是否齐备。
+if (arg("tag-only", false)) {
+  if (!token) { console.error("--tag-only 需要写权限令牌。"); process.exit(2) }
+  await publishTag(commitSha)
+  process.exit(0)
+}
+
 const added = [], modified = [], unchanged = []
 for (const f of local) {
   const r = remote.get(f.rel)
@@ -82,7 +100,9 @@ const gone = [...remote.keys()].filter(p => !local.some(f => f.rel === p))
 console.log(`新增 ${added.length} · 修改 ${modified.length} · 未变 ${unchanged.length}${gone.length ? ` · 远端独有 ${gone.length}: ${gone.join(", ")}` : ""}`)
 for (const f of [...added, ...modified]) console.log(`  ${added.includes(f) ? "A" : "M"} ${f.rel} (${(f.size / 1024).toFixed(0)} KB)`)
 if (dryRun) {
-  console.log("\nDRY RUN：未写入。")
+  const zip = path.join(path.dirname(root), `model-studio-${version}.zip`)
+  console.log(`\n版本号：${version} → tag ${tagName}${noTag ? "（已禁用）" : ""}｜Release ${noRelease ? "（已禁用）" : tagName}${existsSync(zip) ? `＋附件 ${path.basename(zip)}` : "（本地无 zip，附件跳过）"}`)
+  console.log("DRY RUN：未写入。")
   process.exit(0)
 }
 if (!token) {
@@ -92,8 +112,66 @@ if (!token) {
 }
 
 const changed = [...added, ...modified]
+
+// 版本号一起上：注解 tag + Release + 安装包资源。tag 指向本次提交；同名 tag 已存在时不动它——
+// 版本号没升就重复发布说明 plugin.json 忘了改，静默挪 tag 会让别人 clone 到 v0.6.0 却拿到另一份内容。
+async function publishTag(sha) {
+  if (noTag) return
+  let existing = null
+  try { existing = await api("GET", `${API}/repos/${owner}/${repo}/git/ref/tags/${tagName}`) } catch { /* 还没有 tag，正常 */ }
+  if (existing) {
+    // 注解 tag 的 ref 指向 tag 对象而不是提交，要比版本就得先解引用。
+    let at = existing.object?.sha ?? ""
+    if (existing.object?.type === "tag") at = (await api("GET", `${API}/repos/${owner}/${repo}/git/tags/${at}`)).object?.sha ?? at
+    console.log(at === sha ? `tag ${tagName} 已指向 ${sha.slice(0, 7)}。`
+      : `tag ${tagName} 已在别处（${at.slice(0, 7)}），不移动它——重复发布请先升 plugin.json 的 version。`)
+  } else {
+    const tag = await api("POST", `${API}/repos/${owner}/${repo}/git/tags`, {
+      tag: tagName, message: `model-studio ${version}`, object: sha, type: "commit",
+      tagger: { name: authorName, email: authorEmail, date: new Date().toISOString() },
+    })
+    await api("POST", `${API}/repos/${owner}/${repo}/git/refs`, { ref: `refs/tags/${tagName}`, sha: tag.sha })
+    console.log(`已打 tag ${tagName} → ${sha.slice(0, 7)}`)
+  }
+  if (noRelease) return
+  let release
+  try {
+    release = await api("POST", `${API}/repos/${owner}/${repo}/releases`, {
+      tag_name: tagName, name: `model-studio ${version}`,
+      body: `Qoder 插件「建模工作台」${version}。安装：设置 → 插件 → 本地 ZIP 导入下方附件。\n\n提交：\`${sha.slice(0, 7)}\``,
+      draft: false, prerelease: false,
+    })
+    console.log(`Release ${tagName}：${release.html_url ?? release.url}`)
+  } catch (err) {
+    // 422 多半是“tag 打成功、附件没传完”留下的半成品，拿现成 Release 继续补附件；其余错误才放弃。
+    if (!/422/.test(String(err?.message ?? err))) { console.log("Release 未创建：" + String(err?.message ?? err).slice(0, 140)); return }
+    release = await api("GET", `${API}/repos/${owner}/${repo}/releases/tags/${tagName}`)
+    console.log(`Release ${tagName} 已存在（${release.html_url ?? ""}），继续补附件。`)
+  }
+  const zip = path.join(path.dirname(root), `model-studio-${version}.zip`)
+  if (!existsSync(zip)) { console.log(`未找到 ${path.basename(zip)}，先跑 node scripts/pack.mjs 就能把安装包一并传到 Release。`); return }
+  // upload_url 是 {"...assets{?name,label}"} 模板，必须整段花括号换掉；留着 {name} 或 {?name,label} 会被当成路径而 400。
+  const uploadUrl = (release.upload_url || "").split("{")[0] + `?name=${encodeURIComponent(path.basename(zip))}`
+  if (!uploadUrl.startsWith("https://")) { console.log("Release 没有可用 upload_url，跳过附件。"); return }
+  const already = (release.assets ?? []).find(a => a.name === path.basename(zip))
+  if (already) { console.log(`附件已在：${already.name}（${(already.size / 1024).toFixed(0)} KB）→ ${already.browser_download_url ?? ""}`); return }
+  try {
+    const res = await fetch(uploadUrl, {
+      method: "POST", headers: { ...headers, "content-type": "application/octet-stream" },
+      body: readFileSync(zip),
+    })
+    const text = await res.text()
+    if (!res.ok) throw new Error(`${res.status} ${text.slice(0, 160)}`)
+    const a = JSON.parse(text)
+    console.log(`附件已上传：${a.name}（${(a.size / 1024).toFixed(0)} KB）${a.browser_download_url ? " → " + a.browser_download_url : ""}`)
+  } catch (err) {
+    console.log("附件上传失败：" + String(err?.message ?? err).slice(0, 160))
+  }
+}
+
 if (!changed.length && !prune) {
-  console.log("没有变化，无需提交。")
+  console.log("文件没有变化，无需新提交。")
+  await publishTag(commitSha)
   process.exit(0)
 }
 
@@ -162,3 +240,4 @@ if (!pushed) {
 
 console.log(`\n已推送 ${branch}：${commitSha.slice(0, 7)} → ${String(pushed).slice(0, 7)}`)
 console.log(`提交：${message}｜条目变更 ${changed.length}${prune && gone.length ? `｜删除 ${gone.length}` : ""}｜https://github.com/${owner}/${repo}/tree/${branch}`)
+await publishTag(String(pushed))

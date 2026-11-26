@@ -115,7 +115,7 @@ export function createHost(handlers = {}) {
     if (window.parent === window) throw new Error("请在 Qoder 中打开本插件；直接打开 HTML 无法连接宿主。")
     const result = await request("ui/initialize", {
       protocolVersion: "2026-01-26",
-      appInfo: { name: "model-studio", version: "0.6.0" },
+      appInfo: { name: "model-studio", version: "0.7.0" },
       appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
     }, 20000)
     if (closed) return

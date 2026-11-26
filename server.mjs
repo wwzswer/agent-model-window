@@ -1,6 +1,7 @@
-// 建模工作台 MCP 服务器 v0.6（stdio，无第三方运行时依赖）。
+// 建模工作台 MCP 服务器 v0.7（stdio，无第三方运行时依赖）。
 // 职责：模型文件注册与分块传输、盘（plate）工作区存储、按盘统一 GLB 导出、
-//       建模软件适配调度、插件设置；AI 建模/修改基于参数化图元规格（spec JSON），
+//       建模软件适配调度、插件设置、会话外部控制面板（127.0.0.1 HTTP）；
+//       AI 建模/修改基于参数化图元规格（spec JSON），
 //       并由内联几何内核（lib/geometry.node.mjs）提供观察、数值门控、快照回滚与参数搜索。
 import { readFile, writeFile, mkdir, stat, readdir, rm } from "node:fs/promises"
 import { existsSync } from "node:fs"
@@ -11,8 +12,9 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import {
   PLUGIN_ROOT, CACHE_DIR, loadConfig, saveConfig, SETTINGS_SCHEMA, listAdapters, convertToGlb,
 } from "./lib/adapters.mjs"
+import { startPanel, readPanelRecord, PANEL_FILE } from "./lib/panel.mjs"
 
-const SERVER_INFO = { name: "model-studio", version: "0.6.0" }
+const SERVER_INFO = { name: "model-studio", version: "0.7.0" }
 const UI_URI = "ui://model-studio/viewer.html"
 const BROWSER_FORMATS = ["glb", "gltf", "obj", "stl", "ply", "fbx", "3mf", "dae"]
 const IMPORT_EXTENSIONS = [...BROWSER_FORMATS, "blend", "abc", "usd", "usda", "usdc", "usdz", "x3d", "wrl", "step", "stp", "iges", "igs", "brep"]
@@ -172,6 +174,11 @@ let workspace = { plates: [], activePlateId: null }
 let activeModelId = null
 let offersApps = false
 
+// 会话外部控制面板（127.0.0.1 HTTP）：CLI / 资源管理器“打开方式”把文件排进队列，视图轮询取走后导入。
+const PANEL_CLI = path.join(PLUGIN_ROOT, "scripts", "open-in-workbench.mjs")
+const openRequests = []
+let panel = { ok: false, port: 0, url: "", file: PANEL_FILE, error: "尚未启动" }
+
 function summary(model) {
   return {
     id: model.id, name: model.name, format: model.format, sizeBytes: model.sizeBytes,
@@ -312,7 +319,7 @@ async function registerFile(inputPath) {
 }
 
 // ---------- 参数化图元规格（AI 建模） ----------
-const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid", "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield"]
+const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid", "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield", "loft"]
 const GENERATED_DIR = path.join(CACHE_DIR, "generated")
 const MAX_PARTS = 200
 
@@ -357,6 +364,18 @@ function validateHeights(raw, id) {
     return row.map((v, i) => paramValue(v, -10000, 10000, `图元「${id}」heights[${k}][${i}]`))
   })
 }
+function validateLoftSections(raw, id) {
+  if (!Array.isArray(raw) || raw.length < 2 || raw.length > 24) throw new Error(`图元「${id}」：loft 需要 2–24 个 sections（每层 {y, sx, sz, cx, cz, twistDeg, scale}）。`)
+  return raw.map((section, k) => {
+    if (!section || typeof section !== "object" || Array.isArray(section)) throw new Error(`图元「${id}」：sections.${k} 必须是对象。`)
+    const out = { y: paramValue(section.y, -10000, 10000, `图元「${id}」sections.${k}.y`) }
+    for (const key of ["sx", "sz", "cx", "cz", "twistDeg", "scale"]) {
+      if (section[key] === undefined) continue
+      out[key] = paramValue(section[key], -10000, 10000, `图元「${id}」sections.${k}.${key}`)
+    }
+    return out
+  })
+}
 function validateColor(value) {
   const s = String(value).trim().replace(/^#?/, "#")
   if (!/^#[0-9a-fA-F]{3,8}$/.test(s)) throw new Error("color 必须是 #rrggbb 形式的颜色。")
@@ -370,6 +389,7 @@ function validatePart(raw, index) {
   let points = null
   let profile = null
   let heights = null
+  let sections = null
   if (raw.primitive === "lathe") points = validatePointList(raw.params?.points, 2, `图元「${id}」points（[半径, 高度]）`)
   else if (raw.primitive === "tube") points = validatePointList(raw.params?.points, 3, `图元「${id}」points（路径点 [x,y,z]）`)
   else if (raw.primitive === "sweep") {
@@ -381,12 +401,17 @@ function validatePart(raw, index) {
     if (points.length < 3) throw new Error(`图元「${id}」：extrude 截面至少需要 3 个点。`)
   }
   else if (raw.primitive === "heightfield") heights = validateHeights(raw.params?.heights, id)
+  else if (raw.primitive === "loft") {
+    profile = validatePointList(raw.params?.profile, 2, `图元「${id}」profile（XZ 轮廓点 [x,z]）`)
+    if (profile.length < 3) throw new Error(`图元「${id}」：loft 轮廓至少需要 3 个点。`)
+    sections = validateLoftSections(raw.params?.sections, id)
+  }
   if (raw.params !== undefined) {
     if (typeof raw.params !== "object" || raw.params === null || Array.isArray(raw.params)) throw new Error(`图元「${id}」：params 必须是对象。`)
     const keys = Object.keys(raw.params)
     if (keys.length > 12) throw new Error(`图元「${id}」：params 参数过多。`)
     for (const key of keys) {
-      if (key === "points" || key === "profile" || key === "heights") continue
+      if (key === "points" || key === "profile" || key === "heights" || key === "sections") continue
       const isSegments = /segments[a-zA-Z]?/i.test(key)
       const isFlag = key === "closed" || key === "bevel"
       params[key] = isFlag
@@ -397,6 +422,7 @@ function validatePart(raw, index) {
   if (points) params.points = points
   if (profile) params.profile = profile
   if (heights) params.heights = heights
+  if (sections) params.sections = sections
   if (raw.primitive === "rounded_box") {
     const w = params.width ?? 1, h = params.height ?? 1, d = params.depth ?? 1
     const r = params.radius ?? 0.1
@@ -470,16 +496,8 @@ function validateWorkspace(input) {
 
 // ---------- 按盘导出 ----------
 async function plateExportBytes(plate) {
-  const cached = exportCaches.get(plate.id)
-  if (cached) return { bytes: cached.bytes, via: "page-cache" }
-  // 单对象、未编辑的原始 GLB 可直接复用源数据
-  if (plate.items.length === 1) {
-    const item = plate.items[0]
-    const model = models.get(item.modelId)
-    const identity = item.position.every(v => v === 0) && item.rotationDeg.every(v => v === 0) && item.scale.every(v => v === 1)
-    if (model && model.format === "glb" && !model.converted && identity && item.visible) return { bytes: model.bytes, via: "source-glb" }
-  }
-  // 纯 spec 盘：服务端内核直接合并导出，不需要页面在场
+  // 纯 spec 盘优先走内核：spec 与对象变换都在服务器状态里，内核组装的结果永远跟最新一次同步一致；
+  // 页面上传的 GLB 缓存对 spec 盘只是一份快照，可能落后于刚发生的改动，所以这里不让它抢在前面。
   const entries = plate.items.map(item => {
     const model = models.get(item.modelId)
     if (!model || model.format !== "spec" || !model.spec?.parts?.length) return null
@@ -491,9 +509,17 @@ async function plateExportBytes(plate) {
   if (kernel && entries.length && entries.every(Boolean)) {
     return { bytes: await kernel.toGlbMulti(entries), via: "geometry-kernel" }
   }
-  throw new Error(kernel
-    ? `盘「${plate.name}」里含有外部模型（非 AI 生成）且还没有 GLB 缓存。请打开建模视图，等待页面自动同步后重试。`
-    : `该盘需要用内核导出但几何内核不可用，且没有页面缓存。${kernelError ? `（${kernelError}）` : ""}`)
+  const cached = exportCaches.get(plate.id)
+  if (cached) return { bytes: cached.bytes, via: "page-cache" }
+  // 单对象、未编辑的原始 GLB 可直接复用源数据
+  if (plate.items.length === 1) {
+    const item = plate.items[0]
+    const model = models.get(item.modelId)
+    const identity = item.position.every(v => v === 0) && item.rotationDeg.every(v => v === 0) && item.scale.every(v => v === 1)
+    if (model && model.format === "glb" && !model.converted && identity && item.visible) return { bytes: model.bytes, via: "source-glb" }
+  }
+  if (kernel) throw new Error(`盘「${plate.name}」里含有外部模型（非 AI 生成）且还没有 GLB 缓存。请打开建模视图，等待页面自动同步后重试。`)
+  throw new Error(`该盘需要用内核导出但几何内核不可用，且没有页面缓存。${kernelError ? `（${kernelError}）` : ""}`)
 }
 
 async function writePlateExport(plate, outputPath) {
@@ -588,7 +614,7 @@ const tools = [
   },
   {
     name: "agent_create_model", title: "AI 生成模型",
-    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius}（沿路径扫掠圆截面：把手/扶手/管线，closed:1 成环）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
+    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius}（沿路径扫掠圆截面：把手/扶手/管线，closed:1 成环）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）；loft{profile:[[x,z],…3–64] 闭合轮廓, sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}（同一份平面轮廓按水平层逐层缩放/平移/扭转后放样成实体：泪滴/鼠标壳/机头/渐缩罩。sx 与 sz 分开缩放可以“尾部锚住、头部快速收尖”，某层 scale:0 塌成一个顶点即锥尖/泪滴尖，轮廓旋向无所谓、内核按有向体积自动翻法线）。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
     inputSchema: {
       type: "object",
       properties: {
@@ -709,6 +735,11 @@ const tools = [
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
+  {
+    name: "panel_status", title: "外部控制面板",
+    description: "查看会话外部控制面板（只监听 127.0.0.1 的本地 HTTP 端点）是否可用、端口、令牌文件与命令行打开方式。用户想让对话之外的入口（资源管理器“打开方式”、CLI、其它本地软件）点开模型就进工作台时调用它。",
+    inputSchema: emptySchema, annotations: { readOnlyHint: true },
+  },
   // ---- 仅 App 页面可见 ----
   {
     name: "open_viewer", title: "建模视图",
@@ -802,6 +833,12 @@ const tools = [
     annotations: { readOnlyHint: false, idempotentHint: true },
     _meta: { ui: { visibility: ["app"] } },
   },
+  {
+    name: "pending_open_requests", title: "取外部打开请求",
+    description: "页面专用：取走控制面板排队的“打开这个文件”请求（取走即清空），页面据此自动导入。",
+    inputSchema: emptySchema, annotations: { readOnlyHint: false },
+    _meta: { ui: { visibility: ["app"] } },
+  },
 ]
 
 // ---------- 工具实现 ----------
@@ -841,7 +878,13 @@ async function callTool(name, args) {
         file = { total: args.total, chunks: new Map(), size: 0 }
         session.files.set(fileName, file)
       }
-      if (file.total !== args.total) throw new Error("同一文件的分块数不一致。")
+      if (file.total !== args.total) {
+        // 与 upload_export_chunk 同理：页面换块大小重传时块数会变，旧块整批作废。
+        session.size -= file.size
+        file.total = args.total
+        file.size = 0
+        file.chunks.clear()
+      }
       if (!file.chunks.has(args.index)) {
         const bytes = Buffer.from(args.data, "base64")
         session.size += bytes.length
@@ -882,6 +925,22 @@ async function callTool(name, args) {
       } catch { /* 忽略 */ }
       const model = await registerFile(path.join(session.dir, main))
       return modelLoadResult(model)
+    }
+    case "panel_status": {
+      const text = panel.ok
+        ? `外部控制面板已在 ${panel.url} 监听（仅 127.0.0.1）。端口与令牌记录在 ${panel.file}。命令行打开：node "${PANEL_CLI}" "模型绝对路径"；node "${PANEL_CLI}" --register 把它加进 Windows“打开方式”。`
+        : `外部控制面板不可用：${panel.error || "尚未启动。"} 对话内仍可用 open_viewer 或 /open/ 深链接打开工作台。`
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: { panel, cli: PANEL_CLI, panelFile: PANEL_FILE, pending: openRequests.length },
+      }
+    }
+    case "pending_open_requests": {
+      const requests = openRequests.splice(0, openRequests.length)
+      return {
+        content: [{ type: "text", text: requests.length ? `取走 ${requests.length} 个外部打开请求。` : "没有排队的外部打开请求。" }],
+        structuredContent: { requests },
+      }
     }
     case "open_viewer":
       return {
@@ -1267,7 +1326,12 @@ async function callTool(name, args) {
         upload = { plateId: plate.id, total: args.total, chunks: new Map(), createdAt: Date.now() }
         uploads.set(args.uploadId, upload)
       }
-      if (upload.plateId !== plate.id || upload.total !== args.total) throw new Error("uploadId 与盘/分块数不一致。")
+      if (upload.plateId !== plate.id) throw new Error("uploadId 与盘不一致。")
+      if (upload.total !== args.total) {
+        // 页面按宿主入参上限折半重传：块数变了就是从头再来，旧块作废。
+        upload.total = args.total
+        upload.chunks.clear()
+      }
       upload.chunks.set(args.index, Buffer.from(args.data, "base64"))
       if (!args.final) return { content: [{ type: "text", text: `块 ${args.index + 1}/${args.total} 已接收。` }], structuredContent: { ok: true, complete: false } }
       const parts = []
@@ -1409,6 +1473,58 @@ async function handle(request) {
   } catch (error) {
     return fail(-32603, error?.message || "Internal error")
   }
+}
+
+// ---------- 会话外部控制面板 ----------
+async function probePanel(record) {
+  if (!record?.port || !record?.token || record.pid === process.pid) return false
+  const url = record.url || `http://127.0.0.1:${record.port}`
+  try {
+    const res = await fetch(`${url}/status?token=${encodeURIComponent(record.token)}`, { signal: AbortSignal.timeout(900) })
+    return res.ok
+  } catch { return false }
+}
+
+// 面板收到“打开这个文件”：注册成模型 + 排队，视图轮询取走后自动导入。
+async function panelOpenRequest(filePath) {
+  const ext = extOf(filePath)
+  if (!IMPORT_EXTENSIONS.includes(ext)) {
+    throw new Error(`不支持的格式${ext ? ` .${ext}` : ""}。支持：${IMPORT_EXTENSIONS.join("、")}。`)
+  }
+  const model = await registerFile(filePath)
+  activeModelId = model.id
+  const item = { path: model.sourcePath, modelId: model.id, name: model.name, at: Date.now() }
+  const dup = openRequests.findIndex(r => String(r.path).toLowerCase() === item.path.toLowerCase())
+  if (dup > -1) openRequests.splice(dup, 1)
+  openRequests.push(item)
+  if (openRequests.length > 16) openRequests.shift()
+  return {
+    modelId: model.id, name: model.name, format: model.format, queued: openRequests.length,
+    note: "工作台视图打开后会自动导入；视图没在场时请求留在队列里，下次打开工作台即加载。",
+  }
+}
+
+try {
+  const cfg = await loadConfig()
+  const envPort = Number(process.env.MODEL_STUDIO_PANEL_PORT)
+  const existing = await readPanelRecord()
+  if (await probePanel(existing)) {
+    // 多窗口会起多个 MCP 进程：谁先监听谁负责，后来者复用，panel.json 不会被抢写。
+    panel = {
+      ok: true, port: existing.port, url: existing.url || `http://127.0.0.1:${existing.port}`,
+      file: PANEL_FILE, error: `由 PID ${existing.pid} 提供，本进程不再监听。`,
+    }
+  } else {
+    panel = await startPanel({
+      version: SERVER_INFO.version,
+      enabled: cfg.panelEnabled !== false,
+      port: process.env.MODEL_STUDIO_PANEL_PORT !== undefined && Number.isInteger(envPort) ? envPort : cfg.panelPort,
+      onOpen: panelOpenRequest,
+      onStatus: () => ({ plates: workspace.plates.length, models: models.size, activeModelId, pending: openRequests.length }),
+    })
+  }
+} catch (error) {
+  panel = { ok: false, port: 0, url: "", file: PANEL_FILE, error: error?.message ?? String(error) }
 }
 
 let buffer = Buffer.alloc(0)

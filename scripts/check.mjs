@@ -22,7 +22,7 @@ check("Skill frontmatter 存在", Boolean(fm))
 check("Skill name 与目录一致", /name:\s*model-studio/.test(fm?.[1] ?? ""))
 check("Skill description 非空", /description:\s*.{10,}/.test(fm?.[1] ?? ""))
 
-for (const rel of ["server.mjs", "lib/adapters.mjs", "lib/blender_convert.py", "ui/viewer.html", "ui/viewer.bundle.js", "README.md", "examples/adapters.example.json"]) {
+for (const rel of ["server.mjs", "lib/adapters.mjs", "lib/blender_convert.py", "lib/panel.mjs", "scripts/open-in-workbench.mjs", "ui/viewer.html", "ui/viewer.bundle.js", "README.md", "examples/adapters.example.json"]) {
   check(`组件存在 ${rel}`, existsSync(path.join(root, rel)))
 }
 
@@ -74,6 +74,19 @@ const skillTools = ["inspect_model", "check_gates", "optimize_params", "revert_m
 check("Skill 覆盖新工具", skillTools.every(t => skill.includes(t)), skillTools.filter(t => !skill.includes(t)).join(","))
 const readme = await readFile(path.join(root, "README.md"), "utf8")
 check("README 介绍内核与验收闭环", readme.includes("几何内核") && readme.includes("inspect_model"))
+
+// 宿主对 MCP App 工具入参有 1 MiB 硬校验（JSON.stringify(arguments) 字节数），
+// 页面分块上传的 base64 必须留够 JSON 开销，否则每次编辑同步都报“工具参数过大”。
+const mainText = await readFile(path.join(root, "src", "main.js"), "utf8")
+const chunkRaw = Number(/CHUNK_RAW_LIMIT\s*=\s*([\d_]+)/.exec(mainText)?.[1]?.replace(/_/g, ""))
+const argsBytes = Math.ceil(chunkRaw / 3) * 4 + 4096
+check("页面分块大小在宿主入参上限内", chunkRaw > 0 && argsBytes < 1024 * 1024, `块 ${chunkRaw} B → 参数约 ${(argsBytes / 1024).toFixed(0)} KB`)
+check("页面取走外部打开请求", mainText.includes("pending_open_requests"))
+for (const tool of ["panel_status", "pending_open_requests"]) {
+  check(`外部面板工具已声明 ${tool}`, new RegExp(`name:\\s*"${tool}"`).test(serverText))
+}
+check("README 交代外部控制面板", readme.includes("外部控制面板") && readme.includes("open-in-workbench"))
+check("Skill 交代外部入口话术", skill.includes("panel_status") || skill.includes("open-in-workbench"))
 
 console.log(failures === 0 ? "\nCHECK OK" : `\nCHECK FAILED (${failures})`)
 process.exit(failures === 0 ? 0 : 1)
