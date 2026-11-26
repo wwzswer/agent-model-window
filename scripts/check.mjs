@@ -3,6 +3,7 @@ import { readFile, stat } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { releaseEntries } from "./release-files.mjs"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 let failures = 0
@@ -95,6 +96,40 @@ check("内核源码实现 csg 布尔", specText.includes("specCsgGeometry") && s
 check("打包内核带 csg 分支", bundledKernel.includes("csg operands") || bundledKernel.includes("\\u672A\\u77E5\\u7684 csg"))
 check("文档交代布尔能力", skill.includes("csg {op:") && readme.includes("布尔 csg"))
 check("页面图元说明含布尔", html.includes("/ 布尔"))
+
+// 布尔封闭性（0.9，弧形茶壶测试挖出来的三条）：开口面当操作数会漏面，朝向反了等于朝内实体。
+check("内核 tube 默认补端盖", specText.includes("capTubeEnds") && /p\.cap !== 0/.test(specText))
+check("内核 sweep 按有向体积翻正绕向", /orientOutward\(geometry\)/.test(specText))
+check("内核 heightfield 绕向让法线朝上", /idx\.push\(a, a \+ stride, a \+ 1/.test(specText))
+check("内核拒绝不封闭操作数", specText.includes("csgOpenness") && /tube 设了 cap:0/.test(specText))
+check("服务端同规则拒绝不封闭操作数", serverText.includes("csgOpenReason") && serverText.includes('key === "cap"'))
+check("打包内核带 cap 分支", bundledKernel.includes("cap:0"))
+check("门按自己声明的 mode 测量", /overlapOpts\(want/.test(kernelText) && /overlapOpts\(wantGates/.test(kernelText))
+check("曲面示例随包发布", existsSync(path.join(root, "examples", "teapot-arc.spec.json")) && releaseEntries(root).includes("examples/teapot-arc.spec.json"))
+check("Skill 交代操作数封闭性", skill.includes("操作数必须是封闭实体"))
+check("Skill 交代门的 exact 模式", skill.includes('mode:"exact"'))
+check("扫掠变径三处都交代", specText.includes("p.taper") && serverText.includes("taper") && skill.includes("taper") && readme.includes("taper"))
+
+// 参考图驱动重建（0.9，对策是“没参考图会往简单方向靠”）：照片实测的比例、收口半径、缝两侧切线都要写死在示例里。
+const xishiPath = path.join(root, "examples", "teapot-xishi.spec.json")
+check("参考重建示例随包发布", existsSync(xishiPath) && releaseEntries(root).includes("examples/teapot-xishi.spec.json"))
+const xishi = JSON.parse(await readFile(xishiPath, "utf8"))
+const xg = xishi.gates ?? {}
+check("示例把公开尺寸表写成硬门", xg.dimension?.x === 0.1 && xg.dimension?.y === 0.071 && xg.dimension?.z === 0.072 && xg.dimension?.tol <= 0.003)
+check("示例保持球形比例（不许退化成桶形）", xg.dimension?.y / xg.dimension?.z > 0.95, `${(xg.dimension?.y / xg.dimension?.z).toFixed(3)}`)
+const xk = xg.silhouette?.["西施身筒弧线"]
+check("示例用照片轮廓锁身筒包络", xk?.view === "side" && (xk?.points ?? []).length >= 15 && xk?.tol <= 0.005, `${xk?.points?.length ?? 0} 点`)
+const bodyPts = xishi.parts.find(p => p.id === "pot").params.operands[0].params.points
+const lidPts = xishi.parts.find(p => p.id === "lid").params.operands[0].params.points
+const rim = bodyPts[bodyPts.length - 2]
+const lidRim = lidPts.find(q => q[0] > 0)
+check("截盖与壶身在同一半径处收口", rim[0] === lidRim?.[0] && Math.abs(rim[1] - lidRim[1]) <= 0.0002, `r${rim[0]} @${rim[1]}`)
+const slope = (a, b) => Math.abs((b[0] - a[0]) / (b[1] - a[1]))
+const bodyIn = slope(bodyPts[bodyPts.length - 4], rim)
+const lidOut = slope(lidPts[2], lidPts[3])
+check("缝两侧切线连续（盖子不是平顶帽）", bodyIn > 0.5 && lidOut > 0.5 && Math.abs(bodyIn - lidOut) < 0.9, `身 ${bodyIn.toFixed(2)} / 盖 ${lidOut.toFixed(2)}`)
+check("示例登记了流把盖的配合", (xg.clearance?.allow ?? []).length === 4)
+check("示例说明写清参考来源", /照片/.test(xishi.description ?? "") && /110ml|口径/.test(xishi.description ?? ""))
 
 console.log(failures === 0 ? "\nCHECK OK" : `\nCHECK FAILED (${failures})`)
 process.exit(failures === 0 ? 0 : 1)

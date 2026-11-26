@@ -1,0 +1,90 @@
+{
+  "specVersion": 1,
+  "up": "y",
+  "name": "弧形茶壶",
+  "description": "曲面 + 布尔组合测试：鼓腹回转壶身掏腔并打通壶嘴水道、弧管壶嘴掏内腔再斜切壶口、穹顶盖开汽孔、环形底足、弧形把手。Y-up、单位米、地面 y=0。",
+  "parts": [
+    {
+      "id": "foot", "name": "环形底足", "primitive": "csg",
+      "params": {
+        "op": "subtract",
+        "operands": [
+          { "primitive": "cylinder", "params": { "radius": 0.058, "height": 0.012, "segments": 64 } },
+          { "primitive": "cylinder", "params": { "radius": 0.044, "height": 0.03, "segments": 48 }, "position": [0, -0.012, 0] }
+        ]
+      },
+      "position": [0, 0.006, 0], "color": "#5d6b7a", "metalness": 0.75, "roughness": 0.3
+    },
+    {
+      "id": "pot", "name": "壶身（掏腔 + 壶嘴水道）", "primitive": "csg",
+      "params": {
+        "op": "subtract",
+        "operands": [
+          { "primitive": "lathe", "params": { "segments": 96, "points": [[0, 0], [0.052, 0], [0.066, 0.008], [0.084, 0.032], [0.098, 0.062], [0.102, 0.09], [0.098, 0.118], [0.086, 0.142], [0.07, 0.158], [0.062, 0.166], [0, 0.168]] }, "position": [0, 0.012, 0] },
+          { "primitive": "lathe", "params": { "segments": 80, "points": [[0, 0.014], [0.044, 0.014], [0.058, 0.022], [0.074, 0.046], [0.086, 0.072], [0.088, 0.092], [0.082, 0.116], [0.07, 0.136], [0.05, 0.152], [0.026, 0.168], [0, 0.176]] }, "position": [0, 0.012, 0] },
+          { "primitive": "tube", "params": { "radius": 0.0135, "tubularSegments": 40, "radialSegments": 20, "points": [[0.02, 0.074, 0], [0.06, 0.074, 0], [0.1, 0.076, 0], [0.126, 0.08, 0]] } }
+        ]
+      },
+      "position": [0, 0, 0], "color": "#c86a3c", "metalness": 0.25, "roughness": 0.45
+    },
+    {
+      "id": "spout", "name": "弧管壶嘴（掏腔 + 斜口）", "primitive": "csg",
+      "params": {
+        "op": "subtract",
+        "operands": [
+          { "primitive": "sweep", "params": { "profile": { "shape": "circle", "radius": 0.027, "segments": 28 }, "taper": 0.62, "tubularSegments": 72, "points": [[0.062, 0.062, 0], [0.112, 0.066, 0], [0.152, 0.092, 0], [0.172, 0.132, 0], [0.176, 0.166, 0]] } },
+          { "primitive": "tube", "params": { "radius": 0.013, "tubularSegments": 72, "radialSegments": 20, "points": [[0.05, 0.062, 0], [0.112, 0.068, 0], [0.15, 0.094, 0], [0.17, 0.134, 0], [0.186, 0.172, 0]] } },
+          { "primitive": "box", "params": { "width": 0.06, "height": 0.06, "depth": 0.08 }, "position": [0.206, 0.192, 0], "rotationDeg": [0, 0, -32] }
+        ]
+      },
+      "position": [0, 0.012, 0], "color": "#c86a3c", "metalness": 0.25, "roughness": 0.45
+    },
+    {
+      "id": "handle", "name": "弧形把手", "primitive": "tube",
+      "params": {
+        "radius": 0.0125, "tubularSegments": 72, "radialSegments": 20,
+        "points": [[-0.084, 0.148, 0], [-0.132, 0.142, 0], [-0.158, 0.112, 0], [-0.158, 0.07, 0], [-0.128, 0.04, 0], [-0.08, 0.042, 0]]
+      },
+      "position": [0, 0.012, 0], "color": "#8f4a26", "metalness": 0.2, "roughness": 0.5
+    },
+    {
+      "id": "lid", "name": "穹顶盖（汽孔）", "primitive": "csg",
+      "params": {
+        "op": "subtract",
+        "operands": [
+          { "primitive": "lathe", "params": { "segments": 80, "points": [[0, 0], [0.064, 0], [0.062, 0.006], [0.05, 0.018], [0.032, 0.028], [0.012, 0.033], [0, 0.034]] } },
+          { "primitive": "cylinder", "params": { "radius": 0.005, "height": 0.03, "segments": 20 }, "position": [0.028, 0.014, 0], "rotationDeg": [0, 0, 28] }
+        ]
+      },
+      "position": [0, 0.178, 0], "color": "#8f4a26", "metalness": 0.3, "roughness": 0.4
+    },
+    {
+      "id": "knob", "name": "盖钮", "primitive": "sphere",
+      "params": { "radius": 0.014, "segments": 40 },
+      "position": [0, 0.216, 0], "color": "#5d6b7a", "metalness": 0.7, "roughness": 0.28
+    }
+  ],
+  "gates": {
+    "dimension": { "y": 0.23, "tol": 0.004 },
+    "ground": { "tol": 0.0005 },
+    "parts": { "csg": 4, "tube": 1, "sphere": 1 },
+    "silhouette": {
+      "壶腹弧线": {
+        "view": "side",
+        "tol": 0.006,
+        "points": [{ "at": 0.024, "width": 0.143 }, { "at": 0.062, "width": 0.189 }, { "at": 0.101, "width": 0.204 }, { "at": 0.139, "width": 0.191 }, { "at": 0.168, "width": 0.155 }]
+      }
+    },
+    "clearance": {
+      "mode": "exact",
+      "budget": 2000000,
+      "allow": [
+        { "a": "foot", "b": "pot", "reason": "壶身坐在底足上" },
+        { "a": "pot", "b": "spout", "reason": "壶嘴根部埋进壶壁，水道对齐" },
+        { "a": "pot", "b": "handle", "reason": "把手两端埋进壶壁" },
+        { "a": "pot", "b": "lid", "reason": "盖子塞进壶口" },
+        { "a": "lid", "b": "knob", "reason": "盖钮立在盖上" }
+      ]
+    }
+  }
+}

@@ -7,7 +7,7 @@ import {
 } from "./analysis.js"
 import { buildSpecModel, specGeometry, SPEC_PRIMITIVES } from "./spec.js"
 
-export const KERNEL_VERSION = "0.8.0"
+export const KERNEL_VERSION = "0.9.0"
 const round = (v, d = 5) => Number(Number(v).toFixed(d))
 
 // ---------- 求值缓存：同一份 spec 只展开一次 ----------
@@ -115,6 +115,16 @@ function edgeTint(img) {
 }
 
 // ---------- 观察 ----------
+//  clearance 门怎么量，以门自己的声明为准：mode:"exact" 要真实三角求交，不能被调用方的
+//  默认 exact:false 降级成 AABB 粗判——壶嘴×壶盖那种“包围盒贴面但实体不交”会被误报成冲突。
+function overlapOpts(gates, { exact = false, budget = 150000 } = {}) {
+  const cg = gates?.clearance
+  return {
+    exact: Boolean(exact || cg?.mode === "exact"),
+    budget: Math.max(budget, Number(cg?.budget) || 0),
+  }
+}
+
 export function inspect(spec, { mode = "summary", views = [], size = 256, bins = 16, gates = null, exactOverlap = false } = {}) {
   const model = modelOf(spec)
   if (model.empty) throw new Error("spec 未产生任何三角形。")
@@ -129,7 +139,7 @@ export function inspect(spec, { mode = "summary", views = [], size = 256, bins =
   }
   if (wantGates) {
     const samples = { top: sectionWidths(model, "top", 32), side: sectionWidths(model, "side", 32) }
-    const res = checkGates(model, spec, wantGates, { samples, overlaps: overlaps(model, { exact: exactOverlap }) })
+    const res = checkGates(model, spec, wantGates, { samples, overlaps: overlaps(model, overlapOpts(wantGates, { exact: exactOverlap })) })
     out.gates = res
     out.gateError = round(gateError(wantGates, res), 5)
   }
@@ -156,7 +166,7 @@ export function check(spec, gates, { bins = 24, exact = false, budget = 150000 }
   const model = modelOf(spec)
   const want = gates ?? spec.gates ?? {}
   const samples = { top: sectionWidths(model, "top", bins), side: sectionWidths(model, "side", bins) }
-  const res = checkGates(model, spec, want, { bins, samples, overlaps: overlaps(model, { exact, budget }) })
+  const res = checkGates(model, spec, want, { bins, samples, overlaps: overlaps(model, overlapOpts(want, { exact, budget })) })
   return {
     ...res,
     err: round(gateError(want, res), 5),

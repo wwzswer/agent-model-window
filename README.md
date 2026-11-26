@@ -16,7 +16,7 @@ Qoder 插件：让 Agent 在窗口中显示 3D 建模内容。多种建模格式
 - **Blender 版本适配**：自动探测版本（2.80–4.x+）；导入操作符按候选列表探测（`wm.*_import` vs `import_scene.*`），导入/导出参数按当前版本 RNA 属性过滤，跨版本参数改名不会导致失败。低于 2.80 给出明确升级提示。
 - **其他建模软件接入**：设置中指定自定义适配器 JSON（`command` 直接命令行 / `script` 脚本式，占位符 `{input}` `{output}` `{report}` `{script}`），任何能输出 GLB 的工具都可接入。示例见 `examples/adapters.example.json` 与 `lib/freecad_convert.py`（FreeCAD 示例脚本，未在所有版本验证）。
 - **Agent 协作**：`get_workspace` 读取完整盘场景，`get_model_info` 读取模型被哪些盘引用；页面“询问 AI”把当前盘上下文发送到对话；Skill 指导 Agent 为模型文件生成可点击导入的深链接。
-- **AI 建模（参数化图元）**：Agent 调用 `agent_create_model` 用图元规格（spec JSON）直接生成模型。规则图元：立方体 / 圆角盒 / 球 / 圆柱 / 圆锥 / 棱锥 / 环 / 胶囊 / 平面；工程曲面图元：车旋体 lathe（轮廓绕轴回转）、管道 tube（沿路径圆截面扫掠）、扫掠 sweep（沿路径任意 circle/rect/polygon 截面，可 twistDeg 扭转，做型材/梁/异形扶手）、挤出 extrude（平面轮廓沿 Y 拉伸实体，可选 bevel，做法兰/支架/带孔板）、高度场 heightfield（二维高度网格，做地形/波纹板/弧面薄壳）、放样 loft（一份闭合平面轮廓 + 多个 `{y, sx, sz, cx, cz, twistDeg}` 截面层逐层变形，xy 各向异性缩放可以“尾部锚住、头部快速收尖”，`scale:0` 层塌成顶点做锥/泪滴，泪滴/鼠标壳这类跟随轮廓的曲面终于不用拿矩形网格硬凑）、布尔 csg（`{op:"subtract"|"union"|"intersect"|"reverse_subtract", operands:[实体,…2–8]}`，BVH 实时求交：开孔、掏薄壁腔、切斜角、榫槽、熔接成一件，操作数还能各自带变换，最多嵌一层）。segments 可调细分，Y-up、单位米、地面 y=0，页面即时构建并可继续编辑、导出 GLB；`agent_modify_model` 支持图元级 addPart/removePart/setPart 与盘对象级 move/rotate/scale/visible/addItem/removeItem，修订号递增后页面自动重建场景。页面右下“AI 建模”面板可一键把生成/修改需求（含当前盘上下文）发送到对话。
+- **AI 建模（参数化图元）**：Agent 调用 `agent_create_model` 用图元规格（spec JSON）直接生成模型。规则图元：立方体 / 圆角盒 / 球 / 圆柱 / 圆锥 / 棱锥 / 环 / 胶囊 / 平面；工程曲面图元：车旋体 lathe（轮廓绕轴回转）、管道 tube（沿路径圆截面扫掠，**两端默认补端盖成封闭实体**，`cap:0` 才退回开口管面）、扫掠 sweep（沿路径任意 circle/rect/polygon 截面，可 twistDeg 扭转、`taper` 让末端截面按线性比收细（变径管/壶嘴/喷嘴），做型材/梁/异形扶手，两端封头且绕向按有向体积自动翻正）、挤出 extrude（平面轮廓沿 Y 拉伸实体，可选 bevel，做法兰/支架/带孔板）、高度场 heightfield（二维高度网格，做地形/波纹板/弧面薄壳，法线朝上）、放样 loft（一份闭合平面轮廓 + 多个 `{y, sx, sz, cx, cz, twistDeg}` 截面层逐层变形，xy 各向异性缩放可以“尾部锚住、头部快速收尖”，`scale:0` 层塌成顶点做锥/泪滴，泪滴/鼠标壳这类跟随轮廓的曲面终于不用拿矩形网格硬凑）、布尔 csg（`{op:"subtract"|"union"|"intersect"|"reverse_subtract", operands:[实体,…2–8]}`，BVH 实时求交：开孔、掏薄壁腔、切斜角、榫槽、熔接成一件，操作数还能各自带变换，最多嵌一层；操作数一律要求封闭实体，开放面 / `cap:0` 的管子 / 首尾不回轴的回转轮廓在校验阶段就被拒）。同一条 path 的粗 tube 减细 tube 就是空心弯管，再减一只斜 box 得到斜切口——弧形茶壶（`examples/teapot-arc.spec.json`：回转壶身掏腔并打通壶嘴水道 + 变截面空心斜口壶嘴 + 汽孔穹顶盖 + 环形底足 + 弧形把手）是这条链路的验收样例。**有机/曲面形态先拿参考图**：壶、杯、椅这类凭印象建模会系统性退化成“最简泛化形”（桶身＋圈足＋平顶帽盖），所以先 `WebSearch`/`ImageSearch` 取 2–3 张实物照片与厂家公开尺寸表，按行读照片轮廓（最大腹径高度、盖缝位置、左右边缘），把尺寸换算成比例（H/D、缝径/D、流把各出多少）后写成 `dimension` + 多点 `silhouette` 包络门，并在 spec 的 `description` 里交代参考来源与推导链——`examples/teapot-xishi.spec.json` 是这条链路的样板。segments 可调细分，Y-up、单位米、地面 y=0，页面即时构建并可继续编辑、导出 GLB；`agent_modify_model` 支持图元级 addPart/removePart/setPart 与盘对象级 move/rotate/scale/visible/addItem/removeItem，修订号递增后页面自动重建场景。页面右下“AI 建模”面板可一键把生成/修改需求（含当前盘上下文）发送到对话。
 
 ## 组件
 
@@ -62,7 +62,7 @@ Qoder 插件：让 Agent 在窗口中显示 3D 建模内容。多种建模格式
 - 宿主对 MCP App 工具**入参**有 1 MiB 硬校验（按 `JSON.stringify(arguments)` 的字节数算，工具结果不受此限）。页面分块上传因此按每块 700 KB 原始数据（base64 后约 0.89 MiB，余量给 plateId/uploadId 等字段）发送，被拒时自动折半重发；纯 spec 盘干脆不回传字节，GLB 由服务端内核组装。
 - 外部控制面板只监听 `127.0.0.1`，请求必须带 `panel.json` 里的随机令牌；它只能把文件送进“活着的那个 MCP 进程”，视图是否出现在侧边由宿主决定——协议未注册时 CLI 会明确提示回对话点工作台卡片。
 - 不支持 Draco 压缩 / KTX2 纹理 glTF；FBX 外部贴图不随包解析（内嵌贴图可用）。
-- 编辑作用于对象级变换与原点，不含网格级手工建模；AI 建模为参数化图元组合（每模型 ≤200 图元），支持工程类规则曲面（回转 / 扫掠 / 挤出 / 高度场 / 放样）与闭合实体布尔（`csg`：开孔 / 掏腔 / 熔接 / 求交，≤8 操作数、≤1 层嵌套，`plane`、`heightfield` 这类开放曲面不能参与），但不支持任意自由曲面造型（NURBS / 雕刻 / 扫描重建请走外部建模软件产出 GLB）。
+- 编辑作用于对象级变换与原点，不含网格级手工建模；AI 建模为参数化图元组合（每模型 ≤200 图元），支持工程类规则曲面（回转 / 扫掠 / 挤出 / 高度场 / 放样）与闭合实体布尔（`csg`：开孔 / 掏腔 / 熔接 / 求交，≤8 操作数、≤1 层嵌套）。布尔把操作数当封闭实体看：`plane`、`heightfield`、`cap:0` 的 tube、首尾不回到轴上的 lathe 轮廓都不封闭，校验阶段直接拒（真拿去求交会漏面而不是报错）；布尔只在单个图元内生效，跨图元不会互相熔接，接插件靠“埋进配合面”表达接触、由 `clearance` 门登记，但不支持任意自由曲面造型（NURBS / 雕刻 / 扫描重建请走外部建模软件产出 GLB）。
 - 页面状态存于服务器进程内存：服务器重启后需重新加载模型。
 - FreeCAD 示例脚本与自定义适配器实际转换效果取决于用户环境，未在本机验证。
 
@@ -104,6 +104,6 @@ model-studio/
 ├── build/          build.mjs · build-node.mjs · package.json（仅构建用）
 ├── docs/           blender-tcp-outline.md（Blender 直连方案，未实现）
 ├── skills/model-studio/SKILL.md
-├── examples/       adapters.example.json · csg-bracket.spec.json（布尔示例：底板开孔 + U 形槽 + 熔接筋，`node src/kernel.mjs check` 可自校验）
+├── examples/       adapters.example.json · csg-bracket.spec.json（布尔示例：底板开孔 + U 形槽 + 熔接筋）· teapot-arc.spec.json（弧形茶壶：回转掏腔 + 变截面空心斜口壶嘴 + 汽孔盖 + 环形底足 + 弧把手）· teapot-xishi.spec.json（参考图驱动重建的截盖西施：照片逐行轮廓 + 110ml 档公开尺寸 → 球形身筒 + 一捺底 + 同切线球冠盖），三份都自带 gates，`node src/kernel.mjs check <spec>` 可自校验
 └── scripts/        smoke.mjs · check.mjs · pack.mjs · github-push.mjs · release-files.mjs · make-page-test.mjs
 ```

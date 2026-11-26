@@ -21,6 +21,72 @@ const segInt = (v, d, min) => {
   return Number.isFinite(n) ? Math.max(min, Math.min(256, n)) : d
 }
 
+// TubeGeometry 只生成侧面：两端是开口曲面。做渲染无所谓（端头一般埋在别的图元里），
+// 但布尔把操作数当封闭实体看——开口面会让分类器把切割体的面也留在结果里（实测壶嘴漏进切割盒顶点）。
+// 所以默认补两个平面端盖，把 tube 变成封闭实体；cap:0 显式要开口管时不补。
+// 端盖顶点单独复制一份（不与侧壁共享），这样侧壁保持光滑法线、端面是硬边平法线。
+function capTubeEnds(geometry, curve, radialSegments, tubularSegments) {
+  const stride = radialSegments + 1
+  const pos = geometry.attributes.position
+  const nrm = geometry.attributes.normal
+  const tri = Array.from(geometry.index.array)
+  const positions = [], normals = []
+  for (let i = 0; i < pos.count; i++) { positions.push(pos.getX(i), pos.getY(i), pos.getZ(i)); normals.push(nrm.getX(i), nrm.getY(i), nrm.getZ(i)) }
+  for (const [ringIndex, t] of [[0, 0], [tubularSegments, 1]]) {
+    const tangent = curve.getTangentAt(t)
+    const outward = t === 0 ? tangent.clone().negate() : tangent.clone()
+    const center = curve.getPointAt(t)
+    const ring = []
+    for (let j = 0; j < stride; j++) {
+      const i = ringIndex * stride + j
+      const k = positions.length / 3
+      positions.push(pos.getX(i), pos.getY(i), pos.getZ(i))
+      normals.push(outward.x, outward.y, outward.z)
+      ring.push(k)
+    }
+    const c = positions.length / 3
+    positions.push(center.x, center.y, center.z)
+    normals.push(outward.x, outward.y, outward.z)
+    for (let j = 0; j < radialSegments; j++) {
+      const a = ring[j], b = ring[j + 1]
+      // 扇形绕向要朝外：拿叉积和 outward 点乘决定 (c,a,b) 还是 (c,b,a)，省得靠猜环顶点顺序。
+      const va = new THREE.Vector3(positions[a * 3] - center.x, positions[a * 3 + 1] - center.y, positions[a * 3 + 2] - center.z)
+      const vb = new THREE.Vector3(positions[b * 3] - center.x, positions[b * 3 + 1] - center.y, positions[b * 3 + 2] - center.z)
+      const flip = va.cross(vb).dot(outward) < 0
+      tri.push(c, flip ? b : a, flip ? a : b)
+    }
+  }
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3))
+  geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3))
+  geometry.setIndex(tri)
+  geometry.computeBoundingSphere()
+  return geometry
+}
+
+// 有向体积定朝向：封闭网格的有向体积为负说明三角绕向朝内。sweep 历史上就是这样
+// （圆/方/闭合三种截面全负）。渲染用 DoubleSide 看不出来，但布尔把朝内实体当反面，
+// 结果会漏面或漏顶点，所以在算完几何就翻回来，和 loft 用同一招。
+function orientOutward(geometry) {
+  if (!geometry.index) return geometry
+  const pos = geometry.attributes.position
+  const idx = geometry.index.array
+  let vol = 0
+  const v = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()]
+  for (let i = 0; i + 2 < idx.length; i += 3) {
+    for (let k = 0; k < 3; k++) v[k].fromBufferAttribute(pos, idx[i + k])
+    vol += v[0].dot(v[1].clone().cross(v[2])) / 6
+  }
+  if (vol >= 0) return geometry
+  for (let i = 0; i + 2 < idx.length; i += 3) {
+    const t = idx[i + 1]
+    idx[i + 1] = idx[i + 2]
+    idx[i + 2] = t
+  }
+  geometry.index.needsUpdate = true
+  geometry.computeVertexNormals()
+  return geometry
+}
+
 export function specGeometry(primitive, p) {
   switch (primitive) {
     case "box":
@@ -67,8 +133,14 @@ export function specGeometry(primitive, p) {
     case "tube": {
       const pts = (p.points ?? []).map(pt => new THREE.Vector3(pt[0], pt[1], pt[2]))
       if (pts.length < 2) throw new Error("tube 图元至少需要 2 个路径点。")
-      const curve = new THREE.CatmullRomCurve3(pts, p.closed === 1, "catmullrom", 0.5)
-      return new THREE.TubeGeometry(curve, segInt(p.tubularSegments ?? p.segments, 64, 4), p.radius ?? 0.02, segInt(p.radialSegments ?? p.segments, 16, 3))
+      const closed = p.closed === 1
+      const curve = new THREE.CatmullRomCurve3(pts, closed, "catmullrom", 0.5)
+      const tubular = segInt(p.tubularSegments ?? p.segments, 64, 4)
+      const radial = segInt(p.radialSegments ?? p.segments, 16, 3)
+      const geometry = new THREE.TubeGeometry(curve, tubular, p.radius ?? 0.02, radial)
+      // 闭合环（closed:1）没有端面可补；cap:0 是显式要开口管（只做外观、不参与布尔）。
+      if (!closed && p.cap !== 0) capTubeEnds(geometry, curve, radial, tubular)
+      return geometry
     }
     case "sweep": {
       const pts = (p.points ?? []).map(pt => new THREE.Vector3(pt[0], pt[1], pt[2]))
@@ -92,6 +164,8 @@ export function specGeometry(primitive, p) {
       const steps = segInt(p.tubularSegments ?? p.segments, 32, 2)
       const frames = curve.computeFrenetFrames(steps, closed)
       const twist = THREE.MathUtils.degToRad(p.twistDeg ?? 0)
+      // taper = 末端截面 / 起始截面的线性缩放比（壶嘴、喷嘴、变径管这类“沿程收细”靠它）。
+      const taper = Number.isFinite(Number(p.taper)) ? Math.max(0.01, Number(p.taper)) : 1
       const np = ring.length
       const positions = []
       const idx = []
@@ -102,8 +176,9 @@ export function specGeometry(primitive, p) {
         const nrm = frames.normals[Math.min(i, steps)], bin = frames.binormals[Math.min(i, steps)]
         const ang = twist * t
         const ca = Math.cos(ang), sa = Math.sin(ang)
+        const k = 1 + (taper - 1) * t
         for (const [px, py] of ring) {
-          const nx2 = px * ca - py * sa, ny2 = px * sa + py * ca
+          const nx2 = (px * ca - py * sa) * k, ny2 = (px * sa + py * ca) * k
           positions.push(
             point.x + nrm.x * nx2 + bin.x * ny2,
             point.y + nrm.y * nx2 + bin.y * ny2,
@@ -132,6 +207,8 @@ export function specGeometry(primitive, p) {
       const geometry = new THREE.BufferGeometry()
       geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3))
       geometry.setIndex(idx)
+      // 扫掠面的绕向由“路径方向 × 截面点序旋向”决定，不保证朝外：先按有向体积翻正，再算法线。
+      orientOutward(geometry)
       geometry.computeVertexNormals()
       return geometry
     }
@@ -167,7 +244,9 @@ export function specGeometry(primitive, p) {
       for (let k = 0; k < nz; k++) {
         for (let i = 0; i < nx; i++) {
           const a = k * stride + i
-          idx.push(a, a + 1, a + stride, a + 1, a + stride + 1, a + stride)
+          // 绕向 (a, a+stride, a+1) 才让法线朝上：早先用 (a, a+1, a+stride) 生成的地形/波纹板
+          // 整片朝下（24 个顶点没有一个朝上），DoubleSide 渲染看不出来，导出 GLB 就是反的。
+          idx.push(a, a + stride, a + 1, a + 1, a + stride, a + stride + 1)
         }
       }
       const geometry = new THREE.BufferGeometry()
@@ -276,9 +355,25 @@ function csgRunner() {
   }
   return csgEvaluator
 }
+// 布尔把操作数当封闭实体看：开放面会让三角分类器把切割体的面也留在结果里
+// （实测：拿开口 tube 当切割体，结果里冒出了切割盒的顶点）。返回空串表示封闭可用。
+function csgOpenness(node) {
+  const p = node.params ?? {}
+  if (CSG_OPEN_PRIMITIVES.has(node.primitive)) return `「${node.primitive}」本身就是开放曲面`
+  if (node.primitive === "tube" && p.closed !== 1 && p.cap === 0) return "tube 设了 cap:0（开口管）"
+  if (node.primitive === "lathe") {
+    const pts = Array.isArray(p.points) ? p.points : []
+    const first = Math.abs(Number(pts[0]?.[0]) || 0)
+    const last = Math.abs(Number(pts[pts.length - 1]?.[0]) || 0)
+    if (first > 1e-9 || last > 1e-9) return "lathe 轮廓首尾没有回到轴上（半径 0），回转出来是开口壳"
+  }
+  return ""
+}
+
 function csgOperandGeometry(node, depth) {
   if (!node || typeof node !== "object") throw new Error("csg 操作数必须是图元对象。")
-  if (CSG_OPEN_PRIMITIVES.has(node.primitive)) throw new Error(`csg 操作数不能用开放曲面图元「${node.primitive}」。`)
+  const open = csgOpenness(node)
+  if (open) throw new Error(`csg 操作数不封闭：${open}，布尔会出碎片。请换成封闭图元（tube 去掉 cap:0、lathe 让首尾半径为 0）。`)
   const geometry = node.primitive === "csg"
     ? specCsgGeometry(node.params ?? {}, depth + 1)
     : specGeometry(node.primitive, node.params ?? {})

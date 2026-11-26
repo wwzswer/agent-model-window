@@ -347,6 +347,91 @@ try {
   check("examples/csg-bracket 自过验收门", !bracketModel.isError && bracketGates.isError !== true && bracketGates.structuredContent?.ok === true,
     JSON.stringify(bracketGates.structuredContent?.results?.filter(r => !r.ok) ?? "无行").slice(0, 160))
 
+  // ---- 0.9：布尔操作数必须封闭（弧形茶壶测试挖出来的三条）----
+  // 开口 tube 当切割体时，三角分类器会把切割体自己的面留在结果里。探针：斜切盒在 z 方向远超管径，
+  // 结果包围盒的 z 一旦超过管径（60mm）就说明漏面了。
+  const arcPath = [[0, 0.06, 0], [0.06, 0.062, 0], [0.095, 0.085, 0], [0.11, 0.12, 0]]
+  const hollowArc = await call("agent_create_model", {
+    name: "空心弧管",
+    parts: [{ id: "arc", primitive: "csg", params: { op: "subtract", operands: [
+      { primitive: "tube", params: { radius: 0.03, tubularSegments: 48, radialSegments: 20, points: arcPath } },
+      { primitive: "tube", params: { radius: 0.018, tubularSegments: 48, radialSegments: 16, points: arcPath } },
+      { primitive: "box", params: { width: 0.2, height: 0.2, depth: 0.4 }, position: [0.16, 0.2, 0], rotationDeg: [0, 0, -30] },
+    ] } }],
+    gates: { parts: { csg: 1 } },
+  })
+  const arcNum = (await call("inspect_model", { modelId: hollowArc.structuredContent?.model?.id, mode: "summary", bins: 8 })).structuredContent?.numeric
+  check("弧管布尔不漏切割体顶点", !hollowArc.isError && Math.abs((arcNum?.sizeMm?.[2] ?? 0) - 60) < 0.5 && arcNum?.triCount > 200,
+    `z ${arcNum?.sizeMm?.[2]}mm / tri ${arcNum?.triCount}`)
+  const errText = r => (r?.content?.[0]?.text ?? "") + JSON.stringify(r?.structuredContent ?? "")
+  const capOff = await call("agent_create_model", { parts: [{ primitive: "csg", params: { op: "subtract", operands: [
+    { primitive: "tube", params: { radius: 0.03, points: arcPath } },
+    { primitive: "tube", params: { radius: 0.02, cap: 0, points: arcPath } },
+  ] } }] })
+  check("cap:0 开口管不能当布尔操作数", capOff.isError === true && /cap:0/.test(errText(capOff)), errText(capOff).slice(0, 90))
+  const openLathe = await call("agent_create_model", { parts: [{ primitive: "csg", params: { op: "subtract", operands: [
+    { primitive: "lathe", params: { points: [[0.1, 0], [0.12, 0.1], [0.1, 0.2]] } },
+    { primitive: "box", params: { width: 0.05, height: 0.05, depth: 0.05 } },
+  ] } }] })
+  check("开口 lathe 不能当布尔操作数", openLathe.isError === true && /首尾/.test(errText(openLathe)), errText(openLathe).slice(0, 90))
+  const hollowPot = await call("agent_create_model", {
+    name: "回转掏腔小罐",
+    parts: [{ id: "pot", primitive: "csg", params: { op: "subtract", operands: [
+      { primitive: "lathe", params: { segments: 48, points: [[0, 0], [0.1, 0], [0.12, 0.08], [0.08, 0.16], [0, 0.17]] } },
+      { primitive: "lathe", params: { segments: 40, points: [[0, 0.015], [0.088, 0.015], [0.104, 0.08], [0.068, 0.15], [0, 0.175]] } },
+    ] } }],
+    gates: { dimension: { y: 0.17, tol: 0.003 }, parts: { csg: 1 } },
+  })
+  const potGates = await call("check_gates", { modelId: hollowPot.structuredContent?.model?.id })
+  check("首尾回轴的 lathe 掏腔可用", !hollowPot.isError && potGates.structuredContent?.ok === true,
+    JSON.stringify(potGates.structuredContent?.results ?? []).slice(0, 120))
+  // sweep 的绕向由“路径方向 × 截面旋向”决定，历史上是朝内的（有向体积为负）；朝内实体当 base 布尔会碎。
+  const sweepCut = await call("agent_create_model", {
+    name: "方截面梁开孔",
+    parts: [{ id: "beam", primitive: "csg", params: { op: "subtract", operands: [
+      { primitive: "sweep", params: { points: [[0, 0.02, 0], [0.1, 0.02, 0], [0.2, 0.02, 0]], profile: { shape: "rect", width: 0.04, height: 0.02 }, tubularSegments: 24 } },
+      { primitive: "cylinder", params: { radius: 0.01, height: 0.1, segments: 16 }, position: [0.1, 0.02, 0] },
+    ] } }],
+    gates: { parts: { csg: 1 } },
+  })
+  const sweepNum = (await call("inspect_model", { modelId: sweepCut.structuredContent?.model?.id, mode: "summary", bins: 8 })).structuredContent?.numeric
+  check("扫掠体朝外可当布尔基体", !sweepCut.isError && sweepNum?.triCount > 100 && (sweepNum?.sizeMm ?? []).every(v => v <= 200.5),
+    `size ${sweepNum?.sizeMm?.join(" × ")} / tri ${sweepNum?.triCount}`)
+  // taper：末端截面 = 起始截面 × taper。Frenet 帧朝向不固定，所以只比“非路径轴上的两个尺寸”。
+  const taperSpec = { name: "变径梁", parts: [
+    { id: "even", primitive: "sweep", params: { points: [[0, 0.02, 0], [0.1, 0.02, 0], [0.2, 0.02, 0]], profile: { shape: "rect", width: 0.04, height: 0.02 }, tubularSegments: 12 }, position: [0, 0, 0] },
+    { id: "wide", primitive: "sweep", params: { points: [[0, 0.02, 0], [0.1, 0.02, 0], [0.2, 0.02, 0]], profile: { shape: "rect", width: 0.04, height: 0.02 }, taper: 2, tubularSegments: 12 }, position: [0, 0, 0.4] },
+  ] }
+  const taperModel = await call("agent_create_model", taperSpec)
+  const taperParts = (await call("inspect_model", { modelId: taperModel.structuredContent?.model?.id, mode: "full", bins: 8 })).structuredContent?.numeric?.parts ?? []
+  const sideDims = p => p.sizeMm.filter(v => Math.abs(v - 200) > 1).sort((a, b) => a - b).join("×")
+  check("sweep taper 放大末端截面", !taperModel.isError && sideDims(taperParts[0] ?? {}) === "20×40" && sideDims(taperParts[1] ?? {}) === "40×80",
+    `${sideDims(taperParts[0] ?? {})} → ${sideDims(taperParts[1] ?? {})}`)
+  const badTaper = await call("agent_create_model", { parts: [{ ...taperSpec.parts[0], params: { ...taperSpec.parts[0].params, taper: -1 } }] })
+  check("负 taper 被拒绝", badTaper.isError === true)
+  // 门自己声明 mode:"exact" 就按真实三角求交：包围盒贴面但实体不交，不该报冲突。
+  const nearMiss = await call("agent_create_model", { name: "贴面不误报", parts: [
+    { id: "a", primitive: "box", params: { width: 0.2, height: 0.2, depth: 0.2 } },
+    { id: "b", primitive: "sphere", params: { radius: 0.06, segments: 24 }, position: [0.15, 0.15, 0] },
+  ] })
+  const nearId = nearMiss.structuredContent?.model?.id
+  const aabbGate = await call("check_gates", { modelId: nearId, gates: { clearance: { mode: "aabb" } } })
+  const exactGate = await call("check_gates", { modelId: nearId, gates: { clearance: { mode: "exact" } } })
+  check("包围盒贴面在 exact 门下不误报", aabbGate.structuredContent?.ok === false && exactGate.structuredContent?.ok === true,
+    `aabb=${aabbGate.structuredContent?.ok} exact=${exactGate.structuredContent?.ok}`)
+  // 随插件发布的曲面示例：弧形茶壶（回转掏腔 + 弧管布尔 + 斜口 + 汽孔）
+  const teapot = JSON.parse(await readFile(path.join(root, "examples", "teapot-arc.spec.json"), "utf8"))
+  const teapotModel = await call("agent_create_model", { name: teapot.name, description: teapot.description, parts: teapot.parts, gates: teapot.gates })
+  const teapotGates = await call("check_gates", { modelId: teapotModel.structuredContent?.model?.id })
+  check("examples/teapot-arc 自过验收门", !teapotModel.isError && teapotGates.isError !== true && teapotGates.structuredContent?.ok === true,
+    JSON.stringify(teapotGates.structuredContent?.results?.filter(r => !r.ok) ?? "无行").slice(0, 200))
+  // 参考图重建示例：截盖西施（照片逐行轮廓 + 厂家公开尺寸表），门里锁的是照片实测值
+  const xishi = JSON.parse(await readFile(path.join(root, "examples", "teapot-xishi.spec.json"), "utf8"))
+  const xishiModel = await call("agent_create_model", { name: xishi.name, description: xishi.description, parts: xishi.parts, gates: xishi.gates })
+  const xishiGates = await call("check_gates", { modelId: xishiModel.structuredContent?.model?.id })
+  check("examples/teapot-xishi 自过验收门", !xishiModel.isError && xishiGates.isError !== true && xishiGates.structuredContent?.ok === true,
+    JSON.stringify(xishiGates.structuredContent?.results?.filter(r => !r.ok) ?? "无行").slice(0, 200))
+
   // 盘对象级操作 + spec 图元级修改
   const wsSpec = { plates: [{ id: plateId, name: "盘 1", visible: true, items: [...workspace.plates[0].items, { id: "item-spec", modelId: specId, name: "小桌", position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], visible: true }] }], activePlateId: plateId }
   await call("update_workspace_state", { workspace: wsSpec })

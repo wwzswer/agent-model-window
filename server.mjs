@@ -14,7 +14,7 @@ import {
 } from "./lib/adapters.mjs"
 import { startPanel, readPanelRecord, PANEL_FILE } from "./lib/panel.mjs"
 
-const SERVER_INFO = { name: "model-studio", version: "0.8.0" }
+const SERVER_INFO = { name: "model-studio", version: "0.9.0" }
 const UI_URI = "ui://model-studio/viewer.html"
 const BROWSER_FORMATS = ["glb", "gltf", "obj", "stl", "ply", "fbx", "3mf", "dae"]
 const IMPORT_EXTENSIONS = [...BROWSER_FORMATS, "blend", "abc", "usd", "usda", "usdc", "usdz", "x3d", "wrl", "step", "stp", "iges", "igs", "brep"]
@@ -323,6 +323,19 @@ const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "py
 const CSG_OPS = ["subtract", "difference", "union", "add", "merge", "intersect", "intersection", "reverse_subtract", "reverse-subtract"]
 // 布尔靠闭合实体求交，开放曲面（平面/高度场）会碎，直接拦在参数校验阶段。
 const CSG_OPEN_KINDS = ["plane", "heightfield"]
+// 和内核 src/spec.js 的 csgOpenness 保持一致：布尔把操作数当封闭实体，开口面会让分类器
+// 把切割体的面留在结果里。tube 默认补端盖所以封闭（cap:0 才是开口管）；lathe 轮廓首尾不回轴就是开口壳。
+function csgOpenReason(primitive, params) {
+  if (CSG_OPEN_KINDS.includes(primitive)) return `「${primitive}」本身就是开放曲面`
+  if (primitive === "tube" && params?.closed !== 1 && params?.cap === 0) return "tube 设了 cap:0（开口管）"
+  if (primitive === "lathe") {
+    const pts = Array.isArray(params?.points) ? params.points : []
+    const first = Math.abs(Number(pts[0]?.[0]) || 0)
+    const last = Math.abs(Number(pts[pts.length - 1]?.[0]) || 0)
+    if (first > 1e-9 || last > 1e-9) return "lathe 轮廓首尾没有回到轴上（半径 0），回转出来是开口壳"
+  }
+  return ""
+}
 const GENERATED_DIR = path.join(CACHE_DIR, "generated")
 const MAX_PARTS = 200
 
@@ -396,8 +409,9 @@ function validateCsgParams(rawParams, id, depth) {
   return {
     op,
     operands: list.map((operand, i) => {
-      if (CSG_OPEN_KINDS.includes(operand?.primitive)) throw new Error(`图元「${id}」：csg 操作数不能用开放曲面「${operand.primitive}」（布尔会出碎片）。`)
       const part = validatePart(operand, i, depth + 1)
+      const open = csgOpenReason(part.primitive, part.params)
+      if (open) throw new Error(`图元「${id}」：csg 操作数 ${i + 1}（${part.primitive}）不封闭——${open}，布尔会出碎片。请换封闭图元（tube 去掉 cap:0、lathe 让首尾半径为 0）。`)
       return { primitive: part.primitive, params: part.params, position: part.position, rotationDeg: part.rotationDeg, scale: part.scale }
     }),
   }
@@ -436,7 +450,7 @@ function validatePart(raw, index, nest = 0) {
     for (const key of keys) {
       if (key === "points" || key === "profile" || key === "heights" || key === "sections" || key === "op" || key === "operands") continue
       const isSegments = /segments[a-zA-Z]?/i.test(key)
-      const isFlag = key === "closed" || key === "bevel"
+      const isFlag = key === "closed" || key === "bevel" || key === "cap"
       params[key] = isFlag
         ? (Number(raw.params[key]) === 1 ? 1 : 0)
         : paramValue(raw.params[key], isSegments ? 3 : 0.0001, isSegments ? 256 : 10000, `图元「${id}」参数 ${key}`)
@@ -641,7 +655,7 @@ const tools = [
   },
   {
     name: "agent_create_model", title: "AI 生成模型",
-    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius}（沿路径扫掠圆截面：把手/扶手/管线，closed:1 成环）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）；loft{profile:[[x,z],…3–64] 闭合轮廓, sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}（同一份平面轮廓按水平层逐层缩放/平移/扭转后放样成实体：泪滴/鼠标壳/机头/渐缩罩。sx 与 sz 分开缩放可以“尾部锚住、头部快速收尖”，某层 scale:0 塌成一个顶点即锥尖/泪滴尖，轮廓旋向无所谓、内核按有向体积自动翻法线）。布尔图元：csg{op:subtract|union|intersect|reverse_subtract, operands:[{primitive,params,position,rotationDeg,scale},…2–8]}（把若干闭合图元做实体布尔：subtract 按顺序左折叠 ((a−b)−c)，用来开孔/掏腔/切斜面/做榫槽；union 熔成一件；intersect 取公共体积；reverse_subtract 用 base 反切操作数。典型用法：壳体 subtract 一个内腔 = 薄壁件，实体 subtract 圆柱 = 通孔，box subtract 球 = 凹握位。operands 必须是闭合实体（不能用 plane/heightfield），最多嵌套一层 csg；布尔在服务端/页面本地用 BVH 求交实时算，无需外部软件。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
+    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius,cap}（沿路径扫掠圆截面：把手/扶手/管线/壶嘴，closed:1 成环；默认在两端补平面端盖成为封闭实体，因此能直接参与 csg 布尔——粗管 subtract 同路径细管就是空心管，cap:0 才退回开口管面）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, taper, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转；taper 是末端/起始截面的线性缩放比（默认 1，0.5 就是收到一半粗），壶嘴/喷嘴/变径管这类“沿弧线收细”用它；两端封头，是封闭实体可直接进布尔）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）；loft{profile:[[x,z],…3–64] 闭合轮廓, sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}（同一份平面轮廓按水平层逐层缩放/平移/扭转后放样成实体：泪滴/鼠标壳/机头/渐缩罩。sx 与 sz 分开缩放可以“尾部锚住、头部快速收尖”，某层 scale:0 塌成一个顶点即锥尖/泪滴尖，轮廓旋向无所谓、内核按有向体积自动翻法线）。布尔图元：csg{op:subtract|union|intersect|reverse_subtract, operands:[{primitive,params,position,rotationDeg,scale},…2–8]}（把若干闭合图元做实体布尔：subtract 按顺序左折叠 ((a−b)−c)，用来开孔/掏腔/切斜面/做榫槽；union 熔成一件；intersect 取公共体积；reverse_subtract 用 base 反切操作数。典型用法：壳体 subtract 一个内腔 = 薄壁件，实体 subtract 圆柱 = 通孔，box subtract 球 = 凹握位。operands 必须是封闭实体：plane/heightfield 不行，cap:0 的 tube 不行，lathe 当操作数时轮廓首尾半径必须为 0（开口壳会把切割体的面漏进结果）；最多嵌套一层 csg；布尔在服务端/页面本地用 BVH 求交实时算，无需外部软件。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
     inputSchema: {
       type: "object",
       properties: {
