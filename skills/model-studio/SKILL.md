@@ -34,11 +34,12 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
    - 坐标系约定：Y-up、单位米、地面在 y=0；每个图元的 `position` 是其几何中心。
    - 规则图元与 `params`：`box {width,height,depth[,segments|segmentsX/Y/Z]}`、`rounded_box {width,height,depth[,radius,segments]}`（radius<最小边长一半）、`sphere {radius[,segments]}`、`cylinder {radius|radiusTop/radiusBottom,height[,segments]}`、`cone {radius,height[,segments]}`、`pyramid {radius,height}`（四棱锥，底面边与轴对齐）、`torus {radius,tube[,segments,segmentsTubular]}`、`capsule {radius,height[,segments]}`（height 为总高，含两端半球）、`plane {width,height[,segments]}`（水平放置于 XZ 面）。
    - 工程曲面图元与 `params`：`lathe {points:[[半径,y],…2–64][,segments]}`（轮廓绕 Y 轴回转成回转体，适合杯/瓶/罐/塔；端点半径 0 自动封闭）、`tube {points:[[x,y,z],…2–64][,radius,tubularSegments,radialSegments,closed:1]}`（沿路径圆截面扫掠，适合把手/扶手/管线）、`sweep {points:[[x,y,z],…2–64], profile:{shape:"circle"[,radius]|"rect"{width,height}|"polygon"{points:[[x,y],…3–32]}[, twistDeg, tubularSegments, closed:1]}`（沿路径扫掠任意截面，适合型材/工字梁/异形扶手；截面随 Frenet 帧朝向，twistDeg 沿程扭转）、`extrude {points:[[x,z],…3–64], depth[, bevel:1, bevelSize, bevelSegments]}`（平面轮廓沿 +Y 拉伸成实体，bevel 倒角，适合法兰/垫片/L 支架/带孔板轮廓）、`heightfield {width,depth, heights:[[…],2–33 行×2–33 列]}`（逐格给 y 高度的网格曲面，适合地形/波纹板/弧面薄壳；行沿 +Z、列沿 +X，中心在原点）、`loft {profile:[[x,z],…3–64], sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}`（一份闭合平面轮廓按多个水平截面层逐层缩放/平移/扭转后放样成实体，适合泪滴/鼠标壳/机头/渐缩罩这类“轮廓不变但沿程变形”的形状：`sx`/`sz` 分别控 X/Z 方向缩放，可以“尾部锚住、头部快速收尖”；某层 `scale:0` 塌成一个顶点，就是锥/泪滴尖；`profile` 旋向无所谓，内核按有向体积自动翻法线）。曲面图元的 points 相对图元 position。
+   - 布尔图元与 `params`：`csg {op:"subtract"|"union"|"intersect"|"reverse_subtract", operands:[{primitive,params,position,rotationDeg,scale},…2–8]}`（闭合实体实时布尔，不需要外部软件）：`subtract` 按顺序左折叠 `((a−b)−c)`，开孔/掏薄壁腔/切斜角/榫槽都靠它；`union` 熔成一件；`intersect` 取公共体积；`reverse_subtract` 用后面的操作数反切 base。操作数自己的变换相对 csg 图元原点，结果只有一个网格，颜色/金属度取 csg 图元自身字段；`plane`/`heightfield` 这类开放曲面不能当操作数（会出碎片，直接拒）；最多再嵌一层 csg。`optimize_params` 的 `vars.path` 可以下探操作数，如 `parts.0.params.operands.1.params.radius` 调孔径。
    - 精度：segments 默认 球 48 / 圆柱·圆锥 32 / 环面 24×64 / 回转 48 / 管道 64×16 / 扫掠 32×截面（上限 256）；圆润度不足时显式加大 segments，细小特征拆成多图元组合。
    - 每个 part 必有 `primitive`；`id` 省略自动编号；可选 `name`、`position [x,y,z]`、`rotationDeg [x,y,z]`、`scale [x,y,z]`、`color "#rrggbb"`、`metalness`、`roughness`、`visible`。每模型 ≤200 图元。
    - 组合技巧：先想整体尺寸，再按“底座→主体→细节”逐块摆放，保证接触面 y 值衔接（如桌面 y=0.72、厚 0.06 则桌腿中心 y≈0.35）。回转体优先 lathe，变截面路径用 sweep，平面轮廓实体用 extrude，起伏表面用 heightfield。
    - 成功结果带 `importHint.plateName`：页面会弹窗建议以模型名新建盘；向用户说明已生成、可在窗口查看并继续编辑/导出。
-   - 布尔运算、真正的自由曲面（NURBS / 雕刻 / 扫描重建）、精确工程公差做不到——超出时如实说明并建议外部建模软件产出 GLB 再 `open_model`。工程类规则曲面用上面的 lathe/tube/sweep/extrude/heightfield 表达。
+   - 真正的自由曲面（NURBS / 雕刻 / 扫描重建）与精确工程公差做不到——超出时如实说明并建议外部建模软件产出 GLB 再 `open_model`。工程类规则曲面用上面的 lathe/tube/sweep/extrude/heightfield 表达，实体布尔用 csg。
 8. **AI 修改（已生成的 spec 模型或盘中对象）**：调用 `agent_modify_model { modelId?, operations[] }`，一次可提交 1–100 个操作：
    - 图元级（仅 spec 模型，`modelId` 指向 spec 模型）：`{op:"addPart", part:{...}}`、`{op:"removePart", partId}`、`{op:"setPart", partId, ...字段补丁}`。修订号自动递增，页面约 1–3 秒内自动重建场景，无需再调 `open_model`。
    - 对象级（任意格式的盘内条目）：`{op:"moveItem"|"rotateItem"|"scaleItem", itemId, value:[x,y,z]}`、`{op:"setItemVisible", itemId, visible}`、`{op:"removeItem", itemId}`、`{op:"addItem", modelId, plateId?}`。
@@ -85,6 +86,6 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
 
 - 单文件 ≤150 MB；导出 ≤200 MB；注册表最多保留 24 个模型（超出清理最旧）；盘 ≤50、每盘对象 ≤500。
 - 转换超时默认 120 秒，可在设置中调整（10–600 秒）。
-- 页面编辑只作用于对象级变换与原点；AI 建模只组合参数化图元（每模型 ≤200 个），支持工程类规则曲面（回转/扫掠/挤出/高度场），但不做布尔运算、任意自由曲面/雕刻建模——不要向用户承诺这些能力。
+- 页面编辑只作用于对象级变换与原点；AI 建模组合参数化图元（每模型 ≤200 个），支持工程类规则曲面（回转/扫掠/挤出/高度场/放样）与闭合实体的布尔（csg：开孔、掏腔、熔接、求交，≤8 个操作数、≤1 层嵌套），但不做网格级手工编辑、任意自由曲面/雕刻建模（NURBS/雕刻/扫描重建）——不要向用户承诺这些能力。
 - 视图快捷键：F 适配视图；编辑模式下 G 移动 / R 旋转 / S 缩放；Ctrl+D 复制；Delete 删除；Esc 取消选择。
 - 远程会话（Managed SSH / peer）中页面可渲染但消息与本地文件能力受限；此时引导用户用 `open_model` 而非页面“打开文件”。

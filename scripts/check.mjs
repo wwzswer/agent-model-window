@@ -88,5 +88,13 @@ for (const tool of ["panel_status", "pending_open_requests"]) {
 check("README 交代外部控制面板", readme.includes("外部控制面板") && readme.includes("open-in-workbench"))
 check("Skill 交代外部入口话术", skill.includes("panel_status") || skill.includes("open-in-workbench"))
 
+// 布尔建模（0.8 起）：内核、服务端校验、文档三处都得提到 csg，漏一处就是“工具能做但没人知道”
+const specText = await readFile(path.join(root, "src", "spec.js"), "utf8")
+check("服务端图元表含 csg", /const PRIMITIVE_KINDS = \[[^\]]*"csg"/.test(serverText))
+check("内核源码实现 csg 布尔", specText.includes("specCsgGeometry") && specText.includes("three-bvh-csg"))
+check("打包内核带 csg 分支", bundledKernel.includes("csg operands") || bundledKernel.includes("\\u672A\\u77E5\\u7684 csg"))
+check("文档交代布尔能力", skill.includes("csg {op:") && readme.includes("布尔 csg"))
+check("页面图元说明含布尔", html.includes("/ 布尔"))
+
 console.log(failures === 0 ? "\nCHECK OK" : `\nCHECK FAILED (${failures})`)
 process.exit(failures === 0 ? 0 : 1)

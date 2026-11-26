@@ -1607,7 +1607,7 @@ function bindUi() {
   $("aiCreateBtn").addEventListener("click", () => {
     const desc = $("aiPromptInput").value.trim()
     if (!desc) { setStatus("请先在 AI 建模输入框描述想要的模型。", true); $("aiPromptInput").focus(); return }
-    void sendAiRequest(`请在建模工作台中用 agent_create_model 生成一个 3D 模型。需求描述：${desc}\n请用参数化图元（box/rounded_box/sphere/cylinder/cone/pyramid/torus/capsule/plane/lathe/tube/sweep/extrude/heightfield）组合表达，Y-up、单位米、地面 y=0；回转体（杯/瓶/罐/塔）优先用 lathe，圆管/把手用 tube，任意截面沿路径扫掠（型材/梁/异形扶手）用 sweep，平面轮廓拉伸实体（法兰/支架/带孔板）用 extrude，地形/波纹/弧面薄壳用 heightfield，注意 segments 精度。生成后简要说明各图元的作用与整体尺寸。`)
+    void sendAiRequest(`请在建模工作台中用 agent_create_model 生成一个 3D 模型。需求描述：${desc}\n请用参数化图元（box/rounded_box/sphere/cylinder/cone/pyramid/torus/capsule/plane/lathe/tube/sweep/extrude/heightfield）组合表达，Y-up、单位米、地面 y=0；回转体（杯/瓶/罐/塔）优先用 lathe，圆管/把手用 tube，任意截面沿路径扫掠（型材/梁/异形扶手）用 sweep，平面轮廓拉伸实体（法兰/支架/带孔板）用 extrude，地形/波纹/弧面薄壳用 heightfield，需要开孔/掏腔/切角/熔接时用 csg 图元（{op:"subtract",operands:[基础实体, 切割体…]}）。生成后简要说明各图元的作用与整体尺寸。`)
   })
   $("aiModifyBtn").addEventListener("click", () => {
     const desc = $("aiPromptInput").value.trim()

@@ -7,7 +7,7 @@ import {
 } from "./analysis.js"
 import { buildSpecModel, specGeometry, SPEC_PRIMITIVES } from "./spec.js"
 
-export const KERNEL_VERSION = "0.7.0"
+export const KERNEL_VERSION = "0.8.0"
 const round = (v, d = 5) => Number(Number(v).toFixed(d))
 
 // ---------- 求值缓存：同一份 spec 只展开一次 ----------

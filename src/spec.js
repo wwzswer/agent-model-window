@@ -1,11 +1,20 @@
 // 参数化图元（AI 建模 spec，Y-up、米、地面 y=0）→ three 几何 / Object3D。
-// 本模块只依赖 three 核心与 RoundedBoxGeometry，不碰任何浏览器 API，
+// 本模块只依赖 three 核心与几个纯 JS 扩展，不碰任何浏览器 API，
 // 因此浏览器 bundle 与 Node 侧几何内核可以共用同一份实现。
 import * as THREE from "three"
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js"
+// 显式指到 ESM 产物：包名裸解析在 Node 里会拿到 UMD/CJS，具名常量取不全。
+import { ADDITION, Brush, Evaluator, INTERSECTION, REVERSE_SUBTRACTION, SUBTRACTION } from "three-bvh-csg/build/index.module.js"
+import { computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh"
 
 export const SPEC_PRIMITIVES = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid",
-  "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield", "loft"]
+  "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield", "loft", "csg"]
+
+// 布尔运算靠 BVH 三角求交，需要给 BufferGeometry 原型挂上 boundsTree 接口（只在真正用到 csg 时才有开销）。
+if (!THREE.BufferGeometry.prototype.computeBoundsTree) {
+  THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree
+  THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree
+}
 
 const segInt = (v, d, min) => {
   const n = Math.round(Number(v ?? d))
@@ -243,6 +252,83 @@ export function specGeometry(primitive, p) {
   }
 }
 
+// ---------- 布尔运算（csg 图元）----------
+// operands 按顺序左折叠：[a,b,c] + subtract = ((a−b)−c)。操作数各自带 position/rotationDeg/scale，
+// 变换直接烘进几何，所以 csg 部件本身的原点就是 base 操作数的原点。
+const CSG_OPS = {
+  subtract: SUBTRACTION, difference: SUBTRACTION,
+  union: ADDITION, add: ADDITION, merge: ADDITION,
+  intersect: INTERSECTION, intersection: INTERSECTION,
+  reverse_subtract: REVERSE_SUBTRACTION, "reverse-subtract": REVERSE_SUBTRACTION,
+}
+// 开放曲面（非闭合）会让 BVH 布尔产生碎片，明确拒绝而不是给出脏结果。
+const CSG_OPEN_PRIMITIVES = new Set(["plane", "heightfield"])
+const CSG_MAX_OPERANDS = 8
+const CSG_MAX_DEPTH = 1
+let csgEvaluator = null
+function csgRunner() {
+  if (!csgEvaluator) {
+    csgEvaluator = new Evaluator()
+    csgEvaluator.useGroups = false
+    // Evaluator 默认搬运 position/uv/normal，且要求操作数真的带 uv；参数化图元的 uv 对布尔结果毫无意义，
+    // 操作数统一成 position + normal，所以把搬运清单也收窄。
+    csgEvaluator.attributes = ["position", "normal"]
+  }
+  return csgEvaluator
+}
+function csgOperandGeometry(node, depth) {
+  if (!node || typeof node !== "object") throw new Error("csg 操作数必须是图元对象。")
+  if (CSG_OPEN_PRIMITIVES.has(node.primitive)) throw new Error(`csg 操作数不能用开放曲面图元「${node.primitive}」。`)
+  const geometry = node.primitive === "csg"
+    ? specCsgGeometry(node.params ?? {}, depth + 1)
+    : specGeometry(node.primitive, node.params ?? {})
+  const position = Array.isArray(node.position) ? node.position : [0, 0, 0]
+  const rotationDeg = Array.isArray(node.rotationDeg) ? node.rotationDeg : [0, 0, 0]
+  const scale = Array.isArray(node.scale) ? node.scale : [1, 1, 1]
+  const matrix = new THREE.Matrix4().compose(
+    new THREE.Vector3(Number(position[0]) || 0, Number(position[1]) || 0, Number(position[2]) || 0),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(
+      THREE.MathUtils.degToRad(Number(rotationDeg[0]) || 0),
+      THREE.MathUtils.degToRad(Number(rotationDeg[1]) || 0),
+      THREE.MathUtils.degToRad(Number(rotationDeg[2]) || 0))),
+    new THREE.Vector3(...[0, 1, 2].map(i => {
+      const v = Number(scale[i])
+      return Number.isFinite(v) && v !== 0 ? v : 1
+    })),
+  )
+  geometry.applyMatrix4(matrix)
+  // 布尔要求所有操作数属性集完全一致（否则内部分类三角时直接崩），这里统一成 position + normal；
+  // 嵌套 csg 的产物没有 uv，把普通图元的 uv 也削掉正好对齐。
+  for (const key of Object.keys(geometry.attributes)) if (key !== "position" && key !== "normal") geometry.deleteAttribute(key)
+  if (!geometry.attributes.normal) geometry.computeVertexNormals()
+  return geometry
+}
+function specCsgGeometry(p, depth = 0) {
+  if (depth > CSG_MAX_DEPTH) throw new Error(`csg 嵌套最多 ${CSG_MAX_DEPTH} 层。`)
+  const list = Array.isArray(p.operands) ? p.operands : []
+  if (list.length < 2) throw new Error("csg 图元至少需要 2 个 operands（[{primitive,params,…}, …]）。")
+  if (list.length > CSG_MAX_OPERANDS) throw new Error(`csg operands 最多 ${CSG_MAX_OPERANDS} 个。`)
+  const op = CSG_OPS[String(p.op ?? "subtract").toLowerCase()]
+  // ADDITION 的常量值就是 0，不能用真值判断。
+  if (op === undefined) throw new Error(`未知的 csg 运算「${p.op}」（可用：subtract / union / intersect / reverse_subtract）。`)
+  const runner = csgRunner()
+  let acc = new Brush(csgOperandGeometry(list[0], depth))
+  for (let i = 1; i < list.length; i++) {
+    acc = runner.evaluate(acc, new Brush(csgOperandGeometry(list[i], depth)), op)
+  }
+  const geometry = acc.geometry ?? acc
+  geometry.deleteAttribute("color") // 顶点色只是 CSG 内部分类三角用的，别带进渲染和导出
+  geometry.deleteAttribute("uv")
+  // 插值出来的法线不一定单位长，先归一化：否则渲染无碍，但 GLB 导出器会重算一遍并刷屏告警。
+  if (geometry.attributes.normal) geometry.normalizeNormals()
+  geometry.computeBoundingSphere()
+  return geometry
+}
+// 顶层图元取几何：csg 走布尔，其余走参数化图元。
+export function specPartGeometry(part) {
+  return part.primitive === "csg" ? specCsgGeometry(part.params ?? {}, 0) : specGeometry(part.primitive, part.params ?? {})
+}
+
 export function buildSpecModel(spec) {
   const parts = Array.isArray(spec.parts) ? spec.parts : []
   if (!parts.length) throw new Error("spec 模型没有图元。")
@@ -255,7 +341,7 @@ export function buildSpecModel(spec) {
       roughness: part.roughness ?? 0.55,
       side: THREE.DoubleSide,
     })
-    const mesh = new THREE.Mesh(specGeometry(part.primitive, part.params ?? {}), material)
+    const mesh = new THREE.Mesh(specPartGeometry(part), material)
     mesh.name = String(part.name || part.id || part.primitive)
     mesh.userData.specPartId = String(part.id ?? "")
     mesh.userData.specIndex = index

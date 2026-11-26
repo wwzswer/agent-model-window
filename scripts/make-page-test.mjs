@@ -97,6 +97,12 @@ const specDoc = specOverride
     { id: "cup", name: "杯身", primitive: "lathe", params: { segments: 64, points: [[0, 0], [0.35, 0], [0.36, 0.02], [0.30, 0.35], [0.32, 0.60], [0.28, 0.62], [0.27, 0.60], [0, 0.58]] }, position: [0, 0.05, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], color: "#e8e4d8", metalness: 0.05, roughness: 0.4, visible: true },
     { id: "handle", name: "把手", primitive: "tube", params: { radius: 0.035, tubularSegments: 64, radialSegments: 16, points: [[0.32, 0.50, 0], [0.55, 0.50, 0], [0.60, 0.28, 0], [0.32, 0.22, 0]] }, position: [0, 0.05, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], color: "#e8e4d8", metalness: 0.05, roughness: 0.4, visible: true },
     { id: "tip", name: "方糖", primitive: "pyramid", params: { radius: 0.09, height: 0.12 }, position: [-0.55, 0.11, 0.55], rotationDeg: [0, 45, 0], scale: [1, 1, 1], color: "#9aa5b1", metalness: 0.1, roughness: 0.5, visible: true },
+    { id: "lid", name: "透气盖（布尔）", primitive: "csg", params: { op: "subtract", operands: [
+      { primitive: "cylinder", params: { radius: 0.30, height: 0.05, segments: 48 }, position: [0, 0.62, 0] },
+      { primitive: "cylinder", params: { radius: 0.035, height: 0.12, segments: 16 }, position: [0.15, 0.62, 0] },
+      { primitive: "cylinder", params: { radius: 0.035, height: 0.12, segments: 16 }, position: [-0.15, 0.62, 0] },
+      { primitive: "sphere", params: { radius: 0.05, segments: 24 }, position: [0, 0.70, 0] },
+    ] }, position: [0, 0.05, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], color: "#c8b39a", metalness: 0.3, roughness: 0.4, visible: true },
   ],
 }
 const specBytes = Buffer.from(JSON.stringify(specDoc), "utf8")

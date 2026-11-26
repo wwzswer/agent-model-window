@@ -277,6 +277,76 @@ try {
   const badHfTooBig = await call("agent_create_model", { parts: [{ primitive: "heightfield", params: { width: 1, depth: 1, heights: Array.from({ length: 40 }, () => Array.from({ length: 40 }, () => 0)) } }] })
   check("heightfield 超尺寸被拒绝", badHfTooBig.isError === true)
 
+  // ---- 布尔图元：csg（subtract / union / intersect）----
+  const csgSpec = {
+    name: "布尔演示", parts: [
+      { id: "block", primitive: "csg", params: { op: "subtract", operands: [
+        { primitive: "box", params: { width: 0.6, height: 0.2, depth: 0.3 }, position: [0, 0.1, 0] },
+        { primitive: "cylinder", params: { radius: 0.06, height: 0.5, segments: 24 }, position: [0, 0.1, 0], rotationDeg: [90, 0, 0] },
+      ] }, position: [0, 0, 0] },
+      { id: "shell", primitive: "csg", params: { op: "subtract", operands: [
+        { primitive: "cylinder", params: { radius: 0.18, height: 0.3, segments: 32 }, position: [0.9, 0.15, 0] },
+        { primitive: "cylinder", params: { radius: 0.15, height: 0.26, segments: 32 }, position: [0.9, 0.19, 0] },
+      ] } },
+      { id: "joint", primitive: "csg", params: { op: "union", operands: [
+        { primitive: "sphere", params: { radius: 0.09, segments: 24 }, position: [1.4, 0.09, 0] },
+        { primitive: "capsule", params: { radius: 0.04, height: 0.2, segments: 16 }, position: [1.4, 0.1, 0] },
+      ] } },
+      { id: "lens", primitive: "csg", params: { op: "intersect", operands: [
+        { primitive: "sphere", params: { radius: 0.12, segments: 24 }, position: [1.8, 0.12, 0] },
+        { primitive: "box", params: { width: 0.3, height: 0.12, depth: 0.3 }, position: [1.8, 0.1, 0] },
+      ] } },
+    ],
+    gates: { dimension: { x: 2.22, y: 0.3, z: 0.36, tol: 0.005 }, ground: { tol: 0.0005 }, parts: { csg: 4 } },
+  }
+  const csgModel = await call("agent_create_model", csgSpec)
+  const csgId = csgModel.structuredContent?.model?.id
+  check("csg 图元通过校验", !csgModel.isError && csgModel.structuredContent?.model?.format === "spec")
+  const csgJson = JSON.parse(Buffer.from((await rpc("resources/read", { uri: `model://${csgId}/data/0` })).result.contents[0].blob, "base64").toString("utf8"))
+  check("csg operands 原样持久化", csgJson.parts.find(p => p.id === "block")?.params?.operands?.length === 2 && csgJson.parts.find(p => p.id === "block")?.params?.op === "subtract")
+  check("csg 操作数变换保留", csgJson.parts.find(p => p.id === "block")?.params?.operands?.[1]?.rotationDeg?.[0] === 90)
+  const csgInspect = await call("inspect_model", { modelId: csgId, mode: "summary", bins: 12 })
+  const csgNum = csgInspect.structuredContent?.numeric
+  check("csg 内核可求值", !csgInspect.isError && csgNum?.triCount > 100 && csgNum?.sizeMm?.[0] === 2220 && csgNum?.partCount === 4)
+  const csgGates = await call("check_gates", { modelId: csgId })
+  check("csg 数值门通过", csgGates.isError !== true && csgGates.structuredContent?.ok === true)
+  const csgOut = path.join(tmp, "csg.glb")
+  const csgSaved = await call("save_model_glb", { modelId: csgId, outputPath: csgOut })
+  const cgbBytes = existsSync(csgOut) ? await readFile(csgOut) : null
+  check("csg 导出 GLB", !csgSaved.isError && cgbBytes?.subarray(0, 4).toString() === "glTF" && cgbBytes.length > 5000)
+  const badCsgOp = await call("agent_create_model", { parts: [{ primitive: "csg", params: { op: "xor", operands: [{ primitive: "box" }, { primitive: "box" }] } }] })
+  check("未知布尔运算被拒绝", badCsgOp.isError === true)
+  const badCsgOpen = await call("agent_create_model", { parts: [{ primitive: "csg", params: { operands: [{ primitive: "box" }, { primitive: "plane", params: { width: 1, height: 1 } }] } }] })
+  check("开放曲面参与布尔被拒绝", badCsgOpen.isError === true)
+  const badCsgFew = await call("agent_create_model", { parts: [{ primitive: "csg", params: { operands: [{ primitive: "box" }] } }] })
+  check("布尔操作数不足被拒绝", badCsgFew.isError === true)
+  const nestSpec = { primitive: "csg", params: { op: "subtract", operands: [
+    { primitive: "csg", params: { op: "union", operands: [{ primitive: "box", params: { width: 0.3, height: 0.2, depth: 0.2 } }, { primitive: "sphere", params: { radius: 0.1, segments: 16 }, position: [0.2, 0.1, 0] }] } },
+    { primitive: "box", params: { width: 0.1, height: 0.5, depth: 0.1 }, position: [0.1, 0.1, 0] },
+  ] } }
+  const nested = await call("agent_create_model", { parts: [{ ...nestSpec, id: "nested" }], gates: { parts: { csg: 1 } } })
+  check("布尔可嵌一层", !nested.isError && nested.structuredContent?.selfCheck?.ok !== false)
+  const nestedInspect = await call("inspect_model", { modelId: nested.structuredContent?.model?.id, mode: "summary", bins: 8 })
+  check("嵌层布尔内核可求值", !nestedInspect.isError && nestedInspect.structuredContent?.numeric?.triCount > 50)
+  const badCsgNest = await call("agent_create_model", { parts: [{ primitive: "csg", params: { operands: [
+    { ...nestSpec, params: { ...nestSpec.params, operands: [{ ...nestSpec }, { primitive: "sphere", params: { radius: 0.05 } }] } },
+    { primitive: "sphere", params: { radius: 0.08 } },
+  ] } }] })
+  check("布尔超一层嵌套被拒绝", badCsgNest.isError === true)
+  const setCsg = await call("agent_modify_model", { modelId: csgId, operations: [{ op: "setPart", partId: "block", params: { op: "subtract", operands: [
+    { primitive: "box", params: { width: 0.6, height: 0.2, depth: 0.3 }, position: [0, 0.1, 0] },
+    { primitive: "box", params: { width: 0.1, height: 0.4, depth: 0.1 }, position: [0.2, 0.1, 0] },
+  ] } }] })
+  check("setPart 换布尔操作数", !setCsg.isError)
+  const setCsgGates = await call("check_gates", { modelId: csgId, gates: { dimension: { x: 2.22, tol: 0.005 } } })
+  check("换操作数后尺寸仍达标", setCsgGates.isError !== true && setCsgGates.structuredContent?.ok === true)
+  // 随插件发布的布尔示例必须自己过得去（文档里的东西不能是摆设）
+  const bracket = JSON.parse(await readFile(path.join(root, "examples", "csg-bracket.spec.json"), "utf8"))
+  const bracketModel = await call("agent_create_model", { name: bracket.name, description: bracket.description, parts: bracket.parts, gates: bracket.gates })
+  const bracketGates = await call("check_gates", { modelId: bracketModel.structuredContent?.model?.id })
+  check("examples/csg-bracket 自过验收门", !bracketModel.isError && bracketGates.isError !== true && bracketGates.structuredContent?.ok === true,
+    JSON.stringify(bracketGates.structuredContent?.results?.filter(r => !r.ok) ?? "无行").slice(0, 160))
+
   // 盘对象级操作 + spec 图元级修改
   const wsSpec = { plates: [{ id: plateId, name: "盘 1", visible: true, items: [...workspace.plates[0].items, { id: "item-spec", modelId: specId, name: "小桌", position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], visible: true }] }], activePlateId: plateId }
   await call("update_workspace_state", { workspace: wsSpec })

@@ -14,7 +14,7 @@ import {
 } from "./lib/adapters.mjs"
 import { startPanel, readPanelRecord, PANEL_FILE } from "./lib/panel.mjs"
 
-const SERVER_INFO = { name: "model-studio", version: "0.7.0" }
+const SERVER_INFO = { name: "model-studio", version: "0.8.0" }
 const UI_URI = "ui://model-studio/viewer.html"
 const BROWSER_FORMATS = ["glb", "gltf", "obj", "stl", "ply", "fbx", "3mf", "dae"]
 const IMPORT_EXTENSIONS = [...BROWSER_FORMATS, "blend", "abc", "usd", "usda", "usdc", "usdz", "x3d", "wrl", "step", "stp", "iges", "igs", "brep"]
@@ -319,7 +319,10 @@ async function registerFile(inputPath) {
 }
 
 // ---------- 参数化图元规格（AI 建模） ----------
-const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid", "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield", "loft"]
+const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid", "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield", "loft", "csg"]
+const CSG_OPS = ["subtract", "difference", "union", "add", "merge", "intersect", "intersection", "reverse_subtract", "reverse-subtract"]
+// 布尔靠闭合实体求交，开放曲面（平面/高度场）会碎，直接拦在参数校验阶段。
+const CSG_OPEN_KINDS = ["plane", "heightfield"]
 const GENERATED_DIR = path.join(CACHE_DIR, "generated")
 const MAX_PARTS = 200
 
@@ -381,7 +384,25 @@ function validateColor(value) {
   if (!/^#[0-9a-fA-F]{3,8}$/.test(s)) throw new Error("color 必须是 #rrggbb 形式的颜色。")
   return s.toLowerCase()
 }
-function validatePart(raw, index) {
+// csg 操作数保留图元自己的 position/rotationDeg/scale（内核会把它们烘进几何），材料字段丢掉：
+// 布尔结果只有一个网格，操作数各自的颜色/粗糙度没有落点。
+function validateCsgParams(rawParams, id, depth) {
+  const p = rawParams && typeof rawParams === "object" && !Array.isArray(rawParams) ? rawParams : {}
+  const op = String(p.op ?? "subtract").toLowerCase()
+  if (!CSG_OPS.includes(op)) throw new Error(`图元「${id}」：csg 的 op「${p.op}」无效（可用：subtract / union / intersect / reverse_subtract）。`)
+  const list = p.operands
+  if (!Array.isArray(list) || list.length < 2 || list.length > 8) throw new Error(`图元「${id}」：csg 需要 2–8 个 operands（[{primitive, params, position, …}]）。`)
+  if (depth > 1) throw new Error(`图元「${id}」：csg 只允许嵌一层（operands 里的 csg 不能再带 csg 操作数）。`)
+  return {
+    op,
+    operands: list.map((operand, i) => {
+      if (CSG_OPEN_KINDS.includes(operand?.primitive)) throw new Error(`图元「${id}」：csg 操作数不能用开放曲面「${operand.primitive}」（布尔会出碎片）。`)
+      const part = validatePart(operand, i, depth + 1)
+      return { primitive: part.primitive, params: part.params, position: part.position, rotationDeg: part.rotationDeg, scale: part.scale }
+    }),
+  }
+}
+function validatePart(raw, index, nest = 0) {
   if (!raw || typeof raw !== "object") throw new Error(`图元 ${index + 1} 无效。`)
   if (!PRIMITIVE_KINDS.includes(raw.primitive)) throw new Error(`图元 ${index + 1}：不支持的 primitive「${raw.primitive}」（可用：${PRIMITIVE_KINDS.join("/")}）。`)
   const id = String(raw.id ?? `part-${index + 1}`).slice(0, 64)
@@ -390,6 +411,7 @@ function validatePart(raw, index) {
   let profile = null
   let heights = null
   let sections = null
+  let csg = null
   if (raw.primitive === "lathe") points = validatePointList(raw.params?.points, 2, `图元「${id}」points（[半径, 高度]）`)
   else if (raw.primitive === "tube") points = validatePointList(raw.params?.points, 3, `图元「${id}」points（路径点 [x,y,z]）`)
   else if (raw.primitive === "sweep") {
@@ -406,12 +428,13 @@ function validatePart(raw, index) {
     if (profile.length < 3) throw new Error(`图元「${id}」：loft 轮廓至少需要 3 个点。`)
     sections = validateLoftSections(raw.params?.sections, id)
   }
+  else if (raw.primitive === "csg") csg = validateCsgParams(raw.params, id, nest)
   if (raw.params !== undefined) {
     if (typeof raw.params !== "object" || raw.params === null || Array.isArray(raw.params)) throw new Error(`图元「${id}」：params 必须是对象。`)
     const keys = Object.keys(raw.params)
     if (keys.length > 12) throw new Error(`图元「${id}」：params 参数过多。`)
     for (const key of keys) {
-      if (key === "points" || key === "profile" || key === "heights" || key === "sections") continue
+      if (key === "points" || key === "profile" || key === "heights" || key === "sections" || key === "op" || key === "operands") continue
       const isSegments = /segments[a-zA-Z]?/i.test(key)
       const isFlag = key === "closed" || key === "bevel"
       params[key] = isFlag
@@ -423,6 +446,10 @@ function validatePart(raw, index) {
   if (profile) params.profile = profile
   if (heights) params.heights = heights
   if (sections) params.sections = sections
+  if (csg) {
+    params.op = csg.op
+    params.operands = csg.operands
+  }
   if (raw.primitive === "rounded_box") {
     const w = params.width ?? 1, h = params.height ?? 1, d = params.depth ?? 1
     const r = params.radius ?? 0.1
@@ -448,7 +475,7 @@ function validatePart(raw, index) {
 }
 function validateParts(parts) {
   if (!Array.isArray(parts) || parts.length < 1 || parts.length > MAX_PARTS) throw new Error(`parts 必须是 1–${MAX_PARTS} 个图元。`)
-  const out = parts.map(validatePart)
+  const out = parts.map((part, index) => validatePart(part, index))
   const seen = new Set()
   for (const p of out) {
     if (seen.has(p.id)) throw new Error(`图元 id「${p.id}」重复。`)
@@ -614,7 +641,7 @@ const tools = [
   },
   {
     name: "agent_create_model", title: "AI 生成模型",
-    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius}（沿路径扫掠圆截面：把手/扶手/管线，closed:1 成环）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）；loft{profile:[[x,z],…3–64] 闭合轮廓, sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}（同一份平面轮廓按水平层逐层缩放/平移/扭转后放样成实体：泪滴/鼠标壳/机头/渐缩罩。sx 与 sz 分开缩放可以“尾部锚住、头部快速收尖”，某层 scale:0 塌成一个顶点即锥尖/泪滴尖，轮廓旋向无所谓、内核按有向体积自动翻法线）。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
+    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius}（沿路径扫掠圆截面：把手/扶手/管线，closed:1 成环）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）；loft{profile:[[x,z],…3–64] 闭合轮廓, sections:[{y, sx?, sz?, cx?, cz?, twistDeg?, scale?},…2–24]}（同一份平面轮廓按水平层逐层缩放/平移/扭转后放样成实体：泪滴/鼠标壳/机头/渐缩罩。sx 与 sz 分开缩放可以“尾部锚住、头部快速收尖”，某层 scale:0 塌成一个顶点即锥尖/泪滴尖，轮廓旋向无所谓、内核按有向体积自动翻法线）。布尔图元：csg{op:subtract|union|intersect|reverse_subtract, operands:[{primitive,params,position,rotationDeg,scale},…2–8]}（把若干闭合图元做实体布尔：subtract 按顺序左折叠 ((a−b)−c)，用来开孔/掏腔/切斜面/做榫槽；union 熔成一件；intersect 取公共体积；reverse_subtract 用 base 反切操作数。典型用法：壳体 subtract 一个内腔 = 薄壁件，实体 subtract 圆柱 = 通孔，box subtract 球 = 凹握位。operands 必须是闭合实体（不能用 plane/heightfield），最多嵌套一层 csg；布尔在服务端/页面本地用 BVH 求交实时算，无需外部软件。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
     inputSchema: {
       type: "object",
       properties: {

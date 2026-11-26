@@ -9,5 +9,9 @@
   "devDependencies": {
     "esbuild": "^0.25.0",
     "three": "^0.180.0"
+  },
+  "dependencies": {
+    "three-bvh-csg": "^0.0.19",
+    "three-mesh-bvh": "^0.10.0"
   }
 }

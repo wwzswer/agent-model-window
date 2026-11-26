@@ -1,0 +1,208 @@
+{
+  "specVersion": 1,
+  "up": "y",
+  "name": "开孔支架（布尔示例）",
+  "description": "csg 布尔示例：底板双螺栓孔 + 立板 U 形开口槽 + 熔接加强筋。Y-up、单位米、地面 y=0。",
+  "parts": [
+    {
+      "id": "plate",
+      "name": "底板（双螺栓孔）",
+      "primitive": "csg",
+      "params": {
+        "op": "subtract",
+        "operands": [
+          {
+            "primitive": "box",
+            "params": {
+              "width": 0.12,
+              "height": 0.01,
+              "depth": 0.06
+            }
+          },
+          {
+            "primitive": "cylinder",
+            "params": {
+              "radius": 0.0045,
+              "height": 0.05,
+              "segments": 32
+            },
+            "position": [
+              -0.045,
+              0,
+              0
+            ]
+          },
+          {
+            "primitive": "cylinder",
+            "params": {
+              "radius": 0.0045,
+              "height": 0.05,
+              "segments": 32
+            },
+            "position": [
+              0.045,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "position": [
+        0,
+        0.005,
+        0
+      ],
+      "color": "#8fa4bd",
+      "metalness": 0.6,
+      "roughness": 0.35
+    },
+    {
+      "id": "wall",
+      "name": "立板（U 形开口槽）",
+      "primitive": "csg",
+      "params": {
+        "op": "subtract",
+        "operands": [
+          {
+            "primitive": "box",
+            "params": {
+              "width": 0.06,
+              "height": 0.08,
+              "depth": 0.01
+            }
+          },
+          {
+            "primitive": "cylinder",
+            "params": {
+              "radius": 0.012,
+              "height": 0.06,
+              "segments": 32
+            },
+            "position": [
+              0,
+              0.028,
+              0
+            ],
+            "rotationDeg": [
+              90,
+              0,
+              0
+            ]
+          },
+          {
+            "primitive": "box",
+            "params": {
+              "width": 0.024,
+              "height": 0.04,
+              "depth": 0.06
+            },
+            "position": [
+              0,
+              0.05,
+              0
+            ]
+          }
+        ]
+      },
+      "position": [
+        0,
+        0.05,
+        0
+      ],
+      "color": "#b87333",
+      "metalness": 0.5,
+      "roughness": 0.4
+    },
+    {
+      "id": "gusset",
+      "name": "加强筋（熔接）",
+      "primitive": "csg",
+      "params": {
+        "op": "union",
+        "operands": [
+          {
+            "primitive": "box",
+            "params": {
+              "width": 0.008,
+              "height": 0.034,
+              "depth": 0.022
+            },
+            "position": [
+              -0.028,
+              0,
+              0.016
+            ]
+          },
+          {
+            "primitive": "box",
+            "params": {
+              "width": 0.008,
+              "height": 0.034,
+              "depth": 0.022
+            },
+            "position": [
+              0.028,
+              0,
+              0.016
+            ]
+          },
+          {
+            "primitive": "capsule",
+            "params": {
+              "radius": 0.005,
+              "height": 0.03,
+              "segments": 16
+            },
+            "position": [
+              0,
+              0.005,
+              0.028
+            ]
+          }
+        ]
+      },
+      "position": [
+        0,
+        0.027,
+        -0.005
+      ],
+      "color": "#7f93ad",
+      "metalness": 0.55,
+      "roughness": 0.4
+    }
+  ],
+  "gates": {
+    "dimension": {
+      "x": 0.12,
+      "y": 0.09,
+      "z": 0.06,
+      "tol": 0.004
+    },
+    "ground": {
+      "tol": 0.0005
+    },
+    "parts": {
+      "csg": 3
+    },
+    "clearance": {
+      "mode": "aabb",
+      "allow": [
+        {
+          "a": "plate",
+          "b": "wall",
+          "reason": "立板坐在底板上"
+        },
+        {
+          "a": "plate",
+          "b": "gusset",
+          "reason": "筋贴底板"
+        },
+        {
+          "a": "wall",
+          "b": "gusset",
+          "reason": "筋焊在立板背面"
+        }
+      ]
+    }
+  }
+}

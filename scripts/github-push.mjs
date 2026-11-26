@@ -9,6 +9,7 @@
 //   node scripts/github-push.mjs --prune                  # 顺带删除远端有、本地不发布的文件（默认不删）
 //   node scripts/github-push.mjs --no-tag --no-release    # 只推文件，不动 tag / Release
 //   node scripts/github-push.mjs --tag-only               # 不提交文件，只把版本号 tag/Release 补在当前分支提交上
+//   node scripts/github-push.mjs --tree-dir ../release-0.7.0 --no-preflight   # 按另一棵树（如旧版 ZIP 解出的目录）提交并打 tag
 // 版本号默认一起发布：提交推上分支后，在同一个提交上打 v<version> 注解 tag，并建同名 Release；
 // 若本地已有 pack.mjs 产出的 model-studio-<version>.zip，会作为 Release 附件上传——uploads.github.com
 // 实测可达（和 raw.githubusercontent.com 不一样），失败也只降级为“有 Release 没附件”。
@@ -20,6 +21,13 @@ import path from "node:path"
 import { releaseEntries } from "./release-files.mjs"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+// --tree-dir <目录>：把“要发布的内容”换成另一棵树（版本号、文件清单都取自那棵树），脚本自身仍留在当前插件里。
+// 用途是补历史：0.7.0 的文件当时没推，先用 pack.mjs 的 ZIP 解出来，再按 0.7.0 → 0.8.0 的顺序提交，
+// 这样 v0.7.0 这个 tag 指向的提交内容真的是 0.7.0，而不是挂在别的提交上空有名字。
+const treeDirIdx = process.argv.indexOf("--tree-dir")
+const treeDirArg = treeDirIdx > -1 && typeof process.argv[treeDirIdx + 1] === "string" && !process.argv[treeDirIdx + 1].startsWith("--")
+  ? process.argv[treeDirIdx + 1] : ""
+const contentRoot = treeDirArg ? path.resolve(treeDirArg) : root
 const arg = (name, fallback) => {
   const i = process.argv.indexOf("--" + name)
   return i > -1 ? (process.argv[i + 1] && !process.argv[i + 1].startsWith("--") ? process.argv[i + 1] : true) : fallback
@@ -32,7 +40,7 @@ const prune = Boolean(arg("prune", false))
 const noTag = Boolean(arg("no-tag", false))
 const noRelease = Boolean(arg("no-release", false))
 const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || (typeof arg("token", "") === "string" ? arg("token", "") : "")
-const version = JSON.parse(readFileSync(path.join(root, ".qoder-plugin", "plugin.json"), "utf8")).version
+const version = JSON.parse(readFileSync(path.join(contentRoot, ".qoder-plugin", "plugin.json"), "utf8")).version
 const message = arg("message", `model-studio ${version}`) || `model-studio ${version}`
 const customTag = arg("tag-name", null)
 const tagName = typeof customTag === "string" && customTag ? customTag : `v${version}`
@@ -67,12 +75,12 @@ async function api(method, url, body, attempt = 0) {
 // git blob sha 与 GitHub 的 tree 条目一致，可用来跳过未变化的文件（省 API 调用）。
 const gitBlobSha = buf => createHash("sha1").update(`blob ${buf.length}\u0000`).update(buf).digest("hex")
 
-const entries = releaseEntries(root)
+const entries = releaseEntries(contentRoot)
 const local = entries.map(rel => {
-  const buf = readFileSync(path.join(root, rel))
+  const buf = readFileSync(path.join(contentRoot, rel))
   return { rel, sha: gitBlobSha(buf), size: buf.length, text: null }
 })
-console.log(`本地发布 ${local.length} 个文件，${(local.reduce((a, b) => a + b.size, 0) / 1024 / 1024).toFixed(2)} MB`)
+console.log(`${treeDirArg ? "本地发布（树：" + treeDirArg + "）" : "本地发布"} ${local.length} 个文件，${(local.reduce((a, b) => a + b.size, 0) / 1024 / 1024).toFixed(2)} MB`)
 
 const ref = await api("GET", `${API}/repos/${owner}/${repo}/git/ref/heads/${branch}`)
 const commitSha = ref.object.sha
@@ -198,7 +206,7 @@ try {
   // 路线 1：Git Data API（blob → tree → commit → ref），未变化的文件直接沿用 base_tree。
   const tree = []
   for (const f of changed) {
-    const buf = readFileSync(path.join(root, f.rel))
+    const buf = readFileSync(path.join(contentRoot, f.rel))
     const blob = await api("POST", `${API}/repos/${owner}/${repo}/git/blobs`, { content: buf.toString("base64"), encoding: "base64" })
     tree.push({ path: f.rel, mode: "100644", type: "blob", sha: blob.sha })
     await new Promise(r => setTimeout(r, 120))
@@ -224,7 +232,7 @@ try {
 if (!pushed) {
   // 路线 2：POST /repos/{owner}/{repo}/commits —— 一次调用产出一次提交，不依赖 git/blobs。
   const files = changed.map(f => {
-    const buf = readFileSync(path.join(root, f.rel))
+    const buf = readFileSync(path.join(contentRoot, f.rel))
     const entry = { path: f.rel, content: buf.toString("base64"), mode: "100644" }
     if (remote.has(f.rel)) entry.sha = remote.get(f.rel).sha   // 乐观并发：远端 blob 变了就报错而不是静默覆盖
     return entry
