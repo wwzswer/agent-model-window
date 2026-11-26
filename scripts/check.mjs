@@ -52,5 +52,28 @@ for (const rel of ["server.mjs", "lib/adapters.mjs", ".qoder-plugin/plugin.json"
 }
 check("无凭据/密钥", sensitive.length === 0, sensitive.join(","))
 
+// 版本一致性 + 内核产物（0.6 起 server 侧工具依赖 lib/geometry.node.mjs）
+const version = manifest.version
+const serverText = await readFile(path.join(root, "server.mjs"), "utf8")
+const hostText = await readFile(path.join(root, "src", "host.js"), "utf8")
+const kernelText = await readFile(path.join(root, "src", "kernel.mjs"), "utf8")
+const serverVersion = /SERVER_INFO\s*=\s*{[^}]*version:\s*"([^"]+)"/.exec(serverText)?.[1]
+const hostVersion = /appInfo:\s*{\s*name:\s*"model-studio",\s*version:\s*"([^"]+)"/.exec(hostText)?.[1]
+const kernelVersion = /KERNEL_VERSION\s*=\s*"([^"]+)"/.exec(kernelText)?.[1]
+const bundledKernel = existsSync(path.join(root, "lib", "geometry.node.mjs"))
+  ? await readFile(path.join(root, "lib", "geometry.node.mjs"), "utf8")
+  : ""
+check("服务端内核产物存在 lib/geometry.node.mjs", bundledKernel.length > 0, `${(bundledKernel.length / 1024).toFixed(0)} KB`)
+check("四处版本号一致", version === serverVersion && version === hostVersion && version === kernelVersion,
+  `plugin=${version} server=${serverVersion} host=${hostVersion} kernel-src=${kernelVersion}`)
+check("打包内核导出 KERNEL_VERSION 且版本同步", /KERNEL_VERSION/.test(bundledKernel) && bundledKernel.includes(`"${version}"`))
+for (const tool of ["inspect_model", "check_gates", "optimize_params", "snapshot_model", "revert_model", "save_model_glb"]) {
+  check(`工具已声明 ${tool}`, new RegExp(`name:\\s*"${tool}"`).test(serverText))
+}
+const skillTools = ["inspect_model", "check_gates", "optimize_params", "revert_model", "save_model_glb"]
+check("Skill 覆盖新工具", skillTools.every(t => skill.includes(t)), skillTools.filter(t => !skill.includes(t)).join(","))
+const readme = await readFile(path.join(root, "README.md"), "utf8")
+check("README 介绍内核与验收闭环", readme.includes("几何内核") && readme.includes("inspect_model"))
+
 console.log(failures === 0 ? "\nCHECK OK" : `\nCHECK FAILED (${failures})`)
 process.exit(failures === 0 ? 0 : 1)

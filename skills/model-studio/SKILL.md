@@ -5,7 +5,7 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
 
 # 建模工作台（model-studio）
 
-让模型在 Qoder 窗口中可视化：多格式兼容进同一查看器、按“盘”组织场景、预览与简单编辑（移动/旋转/缩放/设置原点/复制）、统一输出为 GLB。AI 建模基于参数化图元规格（spec），用 `agent_create_model` 生成、`agent_modify_model` 修改。
+让模型在 Qoder 窗口中可视化：多格式兼容进同一查看器、按“盘”组织场景、预览与简单编辑（移动/旋转/缩放/设置原点/复制）、统一输出为 GLB。AI 建模基于参数化图元规格（spec），用 `agent_create_model` 生成、`agent_modify_model` 修改；服务端几何内核提供尺寸/轮廓/正交图/相交等**感知**能力与**数值验收门**，生成—检查—修正—快照回退的闭环见第 9–10 条。
 
 ## 工具使用规则
 
@@ -42,6 +42,16 @@ description: 在 Qoder 窗口中预览、简单编辑多种格式 3D 模型、�
    - 图元级（仅 spec 模型，`modelId` 指向 spec 模型）：`{op:"addPart", part:{...}}`、`{op:"removePart", partId}`、`{op:"setPart", partId, ...字段补丁}`。修订号自动递增，页面约 1–3 秒内自动重建场景，无需再调 `open_model`。
    - 对象级（任意格式的盘内条目）：`{op:"moveItem"|"rotateItem"|"scaleItem", itemId, value:[x,y,z]}`、`{op:"setItemVisible", itemId, visible}`、`{op:"removeItem", itemId}`、`{op:"addItem", modelId, plateId?}`。
    - 先用 `get_workspace {}` 拿盘与 `itemId`，用 `list_models {}` 或结果确认 `modelId`；不要在图元格式（非 spec）模型上调 addPart/removePart/setPart（会被拒绝，改用对象级操作）。
+
+9. **感知—验收闭环（AI 建模的默认节奏，禁止凭想象交付）**：几何内核在服务端（`lib/geometry.node.mjs`），不依赖页面是否打开。每轮生成/修改后按下面顺序走：
+   - `agent_create_model` 生成 parts 时**同时给 `gates`**（见下条），把"用户认可的尺寸/落地/轮廓/不互穿"写进 spec，成为后续每次修改的底线。
+   - `inspect_model { modelId?, mode, views, size, bins }` 读真实几何：`mode:"summary"` 拿尺寸/包围盒/最低点/部件表（默认，省 token）；`mode:"full"` 追加分位与直方图；`mode:"outline"` 返回俯视/侧视轮廓采样点数组（几十字节级，最适合判断"是不是变成方块了"）。要看形状时带 `views:["top","side","iso"]`（≤4 个，size 96–384，默认 224），结果以 PNG 图片块返回，可直接观察正交剪影。
+   - `check_gates { modelId?, gates?, exact?, bins?, persist? }` 做数值验收，返回逐条 `{gate, ok, measured, expected, note}` 与总偏差 `err`。`persist:true` 把这次 gates 写进 spec。非 spec 模型调用会明确报错，不要重试。
+   - 未达标 → `agent_modify_model`（可 `dryRun:true`：在内核克隆上试算并返回门报告，**不写盘、不刷新页面**，用来比较两种改法）；改动幅度不确定、要多轮试参时用 `optimize_params { vars, budget, bins, seed, apply }`：工具在服务端反复试参（随机撒点 + 三轮坐标下降），**只回最优的一组数值**，20 次试错不会进入对话。`vars` 形如 `{path:"parts.3.params.radius", min, max, start}`，也支持 `position.0` / `rotationDeg.2` / `scale.1`；非法路径会在调用内核前被拒。`apply:true` 才写回。
+   - 收尾：`save_model_glb { modelId?, outputPath? }` 直接把 GLB 写到磁盘并回路径（全 spec 的盘走内核，无需页面在场）；`export_model` 需要盘级组装/页面缓存时再用。最后 `open_viewer {}` 让用户在窗口里看。
+   - **门（gates）家族**：`dimension {x|y|z:{value,tol}}`（包围盒尺寸，米）、`ground {tol}`（只拦"穿地"：最低点 < −tol 才失败，悬空不报错；要卡贴地精度就看 `measured` 数值）、`silhouette {名称:{view,tol,points:[{at,width}]≤64}}`（指定视图下某位置的轮廓宽度，防"变方块"）、`clearance {mode,minPairs,minMm3,allow≤120,maxTriPairs}`（部件两两相交体积，默认按 `overlapMm3` 阈值而非 AABB 粗判）、`parts {count,ids}`、`custom {名称:{path,op,value,tol}}`（任意数值字段比对）。≤8 个门。
+   - 判读要点：`ground` 负值＝扎进地面，`silhouette` 宽度恒定＝轮廓被矩形底板撑坏，`clearance` 里 `mode:"aabb-capped"`＝三角对超预算退化为 AABB 粗判（可缩小 `allow` 白名单或加 `budget`）。发现这些问题应改 spec（换图元/加特征），而不是只调数值。
+10. **快照与回退**：每次写回 spec（create/modify/optimize apply）前服务器自动快照，环形保留最近 8 条。`snapshot_model {}` 手动加一条并写理由；`revert_model { index }` 回到旧版（`index` 从 `snapshots` 列表取，1＝最旧），`list:true` 只看列表不回退。`summary` 里的 `revision` / `snapshots` 用于确认版本。改坏了不要重新生成整模型，先回退。
 
 ## 页面能力（向用户介绍时使用）
 

@@ -1,0 +1,22 @@
+# 本地构建/调试产物：不进仓库
+node_modules/
+build/node_modules/
+build/.pack.ps1
+build/viewer.injected.html
+build/page-test*.html
+build/mouse-*.json
+build/mouse-*.glb
+build/mouse-*.png
+build/variant-*.mjs
+examples/*.glb
+*.zip
+*.bak
+.DS_Store
+Thumbs.db
+
+# 注意：ui/viewer.bundle.js 与 lib/geometry.node.mjs 虽然是构建产物，但刻意随仓库发布，
+# 这样 clone 下来即可作为 Qoder 插件直接安装；重新生成见 README「开发与验证」。
+mouse-*.glb
+mouse-*.spec.json
+mouse-spec.json
+gen-variants.mjs

@@ -1,17 +1,18 @@
-// 建模工作台 MCP 服务器 v0.5（stdio，无第三方运行时依赖）。
+// 建模工作台 MCP 服务器 v0.6（stdio，无第三方运行时依赖）。
 // 职责：模型文件注册与分块传输、盘（plate）工作区存储、按盘统一 GLB 导出、
-//       建模软件适配调度、插件设置；AI 建模/修改基于参数化图元规格（spec JSON）。
+//       建模软件适配调度、插件设置；AI 建模/修改基于参数化图元规格（spec JSON），
+//       并由内联几何内核（lib/geometry.node.mjs）提供观察、数值门控、快照回滚与参数搜索。
 import { readFile, writeFile, mkdir, stat, readdir, rm } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import path from "node:path"
 import crypto from "node:crypto"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import {
   PLUGIN_ROOT, CACHE_DIR, loadConfig, saveConfig, SETTINGS_SCHEMA, listAdapters, convertToGlb,
 } from "./lib/adapters.mjs"
 
-const SERVER_INFO = { name: "model-studio", version: "0.5.0" }
+const SERVER_INFO = { name: "model-studio", version: "0.6.0" }
 const UI_URI = "ui://model-studio/viewer.html"
 const BROWSER_FORMATS = ["glb", "gltf", "obj", "stl", "ply", "fbx", "3mf", "dae"]
 const IMPORT_EXTENSIONS = [...BROWSER_FORMATS, "blend", "abc", "usd", "usda", "usdc", "usdz", "x3d", "wrl", "step", "stp", "iges", "igs", "brep"]
@@ -24,6 +25,143 @@ const MAX_LINE_BYTES = 8 * 1024 * 1024
 
 const bundleText = (await readFile(path.join(PLUGIN_ROOT, "ui", "viewer.bundle.js"), "utf8")).replaceAll("</script", "<\\/script")
 const html = (await readFile(path.join(PLUGIN_ROOT, "ui", "viewer.html"), "utf8")).replace("/* APP_SCRIPT */", () => bundleText)
+
+// ---------- 几何内核（three 内联的 Node bundle，浏览器/服务端共用同一份实现） ----------
+let kernel = null
+let kernelError = null
+try {
+  kernel = await import(pathToFileURL(path.join(PLUGIN_ROOT, "lib", "geometry.node.mjs")).href)
+} catch (error) {
+  kernelError = error?.message ?? String(error)
+}
+function needKernel() {
+  if (!kernel) {
+    throw new Error("几何内核不可用：缺少 lib/geometry.node.mjs。请在插件目录执行 node build/build-node.mjs 后重启本 MCP 服务器。" + (kernelError ? `（${kernelError}）` : ""))
+  }
+  return kernel
+}
+const SNAPSHOT_MAX = 8
+const MAX_GATES = 8
+
+const clampInt = (v, min, max, dflt) => {
+  const n = Math.round(Number(v))
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt
+}
+const finite = (v, dflt = 0) => (Number.isFinite(Number(v)) ? Number(v) : dflt)
+
+function specOf(model) {
+  if (model.format !== "spec" || !model.spec?.parts?.length) {
+    throw new Error(`模型「${model.name}」是 ${model.format} 文件，内核无法解析。数值观察/门控只支持 agent_create_model 生成的图元模型；外部模型请在建模视图中查看，或先用 AI 重建。`)
+  }
+  return model.spec
+}
+
+// 门控定义规范化：数值有限、条目受限，避免把任意 JSON 带进 spec 文件。
+function validateGates(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("gates 必须是对象。")
+  const keys = Object.keys(raw)
+  if (keys.length > 6) throw new Error("gates 最多 6 类。")
+  const out = {}
+  if (raw.dimension) {
+    const d = {}
+    for (const k of ["x", "y", "z"]) {
+      const v = raw.dimension[k]
+      if (v === undefined) continue
+      d[k] = typeof v === "object"
+        ? { value: finite(v.value), tol: Math.abs(finite(v.tol, 0.002)) }
+        : { value: finite(v), tol: Math.abs(finite(raw.dimension.tol, 0.002)) }
+      if (!(d[k].value > 0) || d[k].value > 100) throw new Error(`gates.dimension.${k} 必须是 0–100 米之间的正数。`)
+    }
+    if (!Object.keys(d).length) throw new Error("gates.dimension 需要 x/y/z 至少一项。")
+    out.dimension = d
+  }
+  if (raw.ground) out.ground = { tol: Math.abs(finite(raw.ground.tol, 0.0005)) }
+  if (raw.silhouette) {
+    const entries = Object.entries(raw.silhouette)
+    if (entries.length > MAX_GATES) throw new Error(`轮廓门最多 ${MAX_GATES} 条。`)
+    out.silhouette = {}
+    for (const [name, g] of entries) {
+      const view = ["top", "front", "side", "rear", "left"].includes(g?.view) ? g.view : "top"
+      const points = Array.isArray(g?.points) ? g.points.slice(0, 64) : []
+      const clean = points.filter(p => Number.isFinite(p?.at) && Number.isFinite(p?.width) && p.width >= 0)
+      if (!clean.length) throw new Error(`gates.silhouette.${name}.points 需要至少一个 {at,width}。`)
+      out.silhouette[String(name).slice(0, 40)] = {
+        view,
+        tol: Math.abs(finite(g?.tol, 0.003)),
+        points: clean.map(p => ({ at: finite(p.at), width: finite(p.width) })),
+      }
+    }
+  }
+  if (raw.clearance) {
+    const c = raw.clearance
+    const allow = Array.isArray(c.allow) ? c.allow.slice(0, 120) : []
+    out.clearance = {
+      mode: c.mode === "exact" ? "exact" : "aabb",
+      minPairs: clampInt(c.minPairs, 1, 10000, 1),
+      minMm3: Math.abs(finite(c.minMm3, 25)),
+      budget: clampInt(c.budget, 1000, 2_000_000, 150000),
+      allow: allow.filter(a => a && typeof a.a === "string" && typeof a.b === "string")
+        .map(a => ({ a: String(a.a).slice(0, 64), b: String(a.b).slice(0, 64), reason: String(a.reason ?? "").slice(0, 80) })),
+    }
+  }
+  if (raw.parts) {
+    const entries = Object.entries(raw.parts).slice(0, 24)
+    out.parts = Object.fromEntries(entries.map(([k, n]) => [String(k).slice(0, 32), clampInt(n, 0, 200, 0)]))
+  }
+  if (raw.custom) {
+    const entries = Object.entries(raw.custom).slice(0, 12)
+    out.custom = Object.fromEntries(entries.map(([k, g]) => [String(k).slice(0, 40), {
+      value: g?.value === undefined ? undefined : finite(g.value),
+      min: g?.min === undefined ? undefined : finite(g.min),
+      max: g?.max === undefined ? undefined : finite(g.max),
+      measured: g?.measured === undefined ? undefined : finite(g.measured),
+      note: String(g?.note ?? "").slice(0, 120),
+    }]))
+  }
+  if (!Object.keys(out).length) throw new Error("gates 未包含可识别的门（dimension/ground/silhouette/clearance/parts/custom）。")
+  return out
+}
+
+function pushSnapshot(model, reason) {
+  if (model.format !== "spec" || !model.spec) return null
+  model.snapshots ??= []
+  const snap = {
+    rev: model.revision ?? 1,
+    at: Date.now(),
+    reason: String(reason ?? "").slice(0, 120),
+    spec: JSON.parse(JSON.stringify(model.spec)),
+  }
+  model.snapshots.push(snap)
+  while (model.snapshots.length > SNAPSHOT_MAX) model.snapshots.shift()
+  return snap
+}
+const snapshotBrief = model => (model.snapshots ?? []).map((s, i) => ({
+  index: i + 1, rev: s.rev, at: new Date(s.at).toISOString().slice(0, 19).replace("T", " "), reason: s.reason,
+  parts: s.spec?.parts?.length ?? 0,
+}))
+
+// 门控自检的容错包装：内核异常不应该让工具调用整体失败。
+function safeGateReport(fn) {
+  try {
+    const result = fn()
+    const brief = !result.results.length ? "模型还没有定义任何门"
+      : result.ok ? `全部达标（${result.results.map(r => r.gate).join("、")}）`
+        : result.results.map(r => `${r.gate} ${r.ok ? "达标" : "未达标：" + String(r.note).slice(0, 90)}`).join("；")
+    return { brief, result }
+  } catch (error) {
+    return { brief: `自检失败：${String(error.message).slice(0, 140)}`, result: { error: String(error.message) } }
+  }
+}
+
+async function persistSpec(model, reason) {
+  const jsonText = JSON.stringify(model.spec)
+  await writeFile(model.sourcePath, jsonText, "utf8")
+  model.bytes = Buffer.from(jsonText, "utf8")
+  model.sizeBytes = model.bytes.length
+  model.revision = (model.revision ?? 1) + 1
+  model.lastChange = reason
+  if (kernel) kernel.clearCache?.()
+}
 
 // ---------- 状态 ----------
 const models = new Map()
@@ -38,6 +176,7 @@ function summary(model) {
   return {
     id: model.id, name: model.name, format: model.format, sizeBytes: model.sizeBytes,
     sourcePath: model.sourcePath, converted: model.converted, converter: model.converter ?? null,
+    revision: model.revision ?? 1, snapshots: model.snapshots?.length ?? 0,
   }
 }
 const modelList = () => [...models.values()].map(summary)
@@ -330,21 +469,35 @@ function validateWorkspace(input) {
 }
 
 // ---------- 按盘导出 ----------
-function plateExportBytes(plate) {
+async function plateExportBytes(plate) {
   const cached = exportCaches.get(plate.id)
-  if (cached) return cached.bytes
+  if (cached) return { bytes: cached.bytes, via: "page-cache" }
   // 单对象、未编辑的原始 GLB 可直接复用源数据
   if (plate.items.length === 1) {
     const item = plate.items[0]
     const model = models.get(item.modelId)
     const identity = item.position.every(v => v === 0) && item.rotationDeg.every(v => v === 0) && item.scale.every(v => v === 1)
-    if (model && model.format === "glb" && !model.converted && identity && item.visible) return model.bytes
+    if (model && model.format === "glb" && !model.converted && identity && item.visible) return { bytes: model.bytes, via: "source-glb" }
   }
-  throw new Error("该盘还没有可用的 GLB 导出缓存。请打开建模视图，等待页面自动同步后重试。")
+  // 纯 spec 盘：服务端内核直接合并导出，不需要页面在场
+  const entries = plate.items.map(item => {
+    const model = models.get(item.modelId)
+    if (!model || model.format !== "spec" || !model.spec?.parts?.length) return null
+    return {
+      spec: model.spec, name: item.name || model.name, position: item.position,
+      rotationDeg: item.rotationDeg, scale: item.scale, visible: item.visible,
+    }
+  })
+  if (kernel && entries.length && entries.every(Boolean)) {
+    return { bytes: await kernel.toGlbMulti(entries), via: "geometry-kernel" }
+  }
+  throw new Error(kernel
+    ? `盘「${plate.name}」里含有外部模型（非 AI 生成）且还没有 GLB 缓存。请打开建模视图，等待页面自动同步后重试。`
+    : `该盘需要用内核导出但几何内核不可用，且没有页面缓存。${kernelError ? `（${kernelError}）` : ""}`)
 }
 
 async function writePlateExport(plate, outputPath) {
-  const bytes = plateExportBytes(plate)
+  const { bytes, via } = await plateExportBytes(plate)
   const firstModel = models.get(plate.items[0]?.modelId)
   let target
   if (outputPath) {
@@ -369,7 +522,7 @@ async function writePlateExport(plate, outputPath) {
   if (!/\.glb$/i.test(target)) target += ".glb"
   await mkdir(path.dirname(target), { recursive: true })
   await writeFile(target, bytes)
-  return { path: target, sizeBytes: bytes.length }
+  return { path: target, sizeBytes: bytes.length, via }
 }
 
 // ---------- 工具定义 ----------
@@ -442,6 +595,7 @@ const tools = [
         name: { type: "string", maxLength: 64, description: "模型名称（也用作建议盘名），如「茶杯」" },
         description: { type: "string", maxLength: 500, description: "文字描述，记录在规格文件里" },
         parts: { type: "array", minItems: 1, maxItems: 200, description: "图元列表" },
+        gates: { type: "object", description: "可选：随模型一起存的数值验收门（dimension/ground/silhouette/clearance/parts/custom），之后每次修改都用 check_gates 把关" },
       },
       required: ["parts"], additionalProperties: false,
     },
@@ -450,17 +604,110 @@ const tools = [
   },
   {
     name: "agent_modify_model", title: "AI 修改模型",
-    description: "按操作列表修改场景。spec 图元操作（需 modelId 指向 agent_create_model 生成的模型）：{op:addPart,part}、{op:removePart,partId}、{op:setPart,partId,可改 primitive/params/position/rotationDeg/scale/color/metalness/roughness/visible/name}。盘对象操作（任何模型）：{op:moveItem|rotateItem|scaleItem,itemId,position|rotationDeg|scale}、{op:setItemVisible,itemId,visible}、{op:removeItem,itemId}、{op:addItem,modelId,plateId?,transform?}。返回更新后的模型与工作区，工作台自动刷新，导出 GLB 包含修改。",
+    description: "按操作列表修改场景。spec 图元操作（需 modelId 指向 agent_create_model 生成的模型）：{op:addPart,part}、{op:removePart,partId}、{op:setPart,partId,可改 primitive/params/position/rotationDeg/scale/color/metalness/roughness/visible/name, mergeParams:true 只覆盖给出的参数}、{op:setGates,gates}。盘对象操作（任何模型）：{op:moveItem|rotateItem|scaleItem,itemId,position|rotationDeg|scale}、{op:setItemVisible,itemId,visible}、{op:removeItem,itemId}、{op:addItem,modelId,plateId?,transform?}。dryRun=true 时只在副本上试算并返回数值门结果与差异，不落盘、不快照，适合先看代价。写回前会自动快照，可 revert_model 回滚。返回更新后的模型与工作区，工作台自动刷新，导出 GLB 包含修改。",
     inputSchema: {
       type: "object",
       properties: {
         modelId: { type: "string", description: "图元操作目标：AI 生成的 spec 模型 id" },
         operations: { type: "array", minItems: 1, maxItems: 100, description: "操作列表，按序执行" },
+        dryRun: { type: "boolean", description: "只试算不写回，返回逐条门的偏差" },
+        reason: { type: "string", maxLength: 120, description: "本批修改的说明，记入快照便于回滚识别" },
       },
       required: ["operations"], additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     _meta: { ui: { resourceUri: UI_URI } },
+  },
+  {
+    name: "inspect_model", title: "观察模型",
+    description: "用服务端几何内核「看」自己生成的模型：返回尺寸/包围盒/部件/轮廓宽度序列等数值，并可同时返回正交视图 PNG 图片（top/front/side/iso）。这是 Agent 的眼睛——改完模型必须先看这里，不要凭想象判断形状。mode=summary 省 token（默认，12 段轮廓），mode=full 附部件明细与重叠清单，mode=outline 只要轮廓曲线。views 传 1–4 个视图即返回图片。仅支持 agent_create_model 生成的 spec 模型。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        modelId: { type: "string", description: "省略时使用最近生成的 spec 模型" },
+        mode: { type: "string", enum: ["summary", "full", "outline"], description: "详细级别，默认 summary" },
+        views: { type: "array", items: { type: "string", enum: ["top", "front", "side", "rear", "left", "iso"] }, maxItems: 4, description: "需要出图的视图，省略则只回数值" },
+        size: { type: "integer", minimum: 96, maximum: 384, description: "图片边长像素，默认 224" },
+        bins: { type: "integer", minimum: 6, maximum: 40, description: "轮廓分段数，默认 12" },
+        gates: { type: "object", description: "临时用一组门做判定（不写入模型）" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: "check_gates", title: "数值验收门",
+    description: "对 spec 模型执行验收门并返回逐条 PASS/FAIL 与偏差数值。门类型：dimension(x/y/z 尺寸±容差)、ground(最低点不得穿地)、silhouette(按位置采样的轮廓宽度)、clearance(实体相交冲突，allow 登记故意咬合)、parts(图元数量)、custom(自报数值)。gates 省略时使用 spec.gates；传入 gates 时会同时写入模型规格，成为后续每次修改的自动底线。改模型的正确循环：改 → inspect → check → 不达标再改。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        modelId: { type: "string" },
+        gates: { type: "object", description: "新的门定义；省略则校验已存的 spec.gates" },
+        exact: { type: "boolean", description: "clearance 用真实三角面相交计数（慢，默认 false 用 AABB 嵌入体积）" },
+        bins: { type: "integer", minimum: 8, maximum: 40, description: "轮廓采样段数，默认 24" },
+        persist: { type: "boolean", description: "传了 gates 时是否写入规格文件，默认 true" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "optimize_params", title: "参数内环搜索",
+    description: "在工具内部反复调参并用数值门打分（随机撒点＋坐标细搜），只把最优结果与代价返回对话——把「试 20 次」这种内环留在本地，避免占满上下文。vars 每项 {path,min,max,start}，path 形如 parts.3.params.radius 或 parts.3.position.1。apply=true 时把最优参数写入模型（自动快照，可 revert_model 回滚）。需要 gates 或 spec.gates。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        modelId: { type: "string" },
+        gates: { type: "object" },
+        vars: { type: "array", minItems: 1, maxItems: 12, description: "可调参数与范围" },
+        budget: { type: "integer", minimum: 4, maximum: 80, description: "随机撒点次数，默认 20" },
+        bins: { type: "integer", minimum: 8, maximum: 32 },
+        seed: { type: "integer" },
+        apply: { type: "boolean", description: "达标即写回模型，默认 false" },
+      },
+      required: ["vars"], additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  {
+    name: "snapshot_model", title: "存档当前版本",
+    description: "为 spec 模型手动存一个快照（最多保留 8 个，先进先出）。在做一批风险修改前调用，之后可用 revert_model 回到这里。agent_modify_model / optimize_params 写回时也会自动快照。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        modelId: { type: "string" },
+        reason: { type: "string", maxLength: 120, description: "这次存档是为了什么" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "revert_model", title: "回滚版本",
+    description: "把 spec 模型回滚到某个快照（index 从 1 开始；省略 index 时回到最近一次快照）。回滚本身也会先存档，所以可以再 revert 回来。返回 reloadSpecs 让页面刷新。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        modelId: { type: "string" },
+        index: { type: "integer", minimum: 1, maximum: 8, description: "快照序号，见 snapshot_model/get_model_info" },
+        list: { type: "boolean", description: "true 时只列出快照，不改动模型" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  },
+  {
+    name: "save_model_glb", title: "直出 GLB",
+    description: "由服务端几何内核把 spec 模型直接导出为 GLB，不依赖建模视图页面是否打开。outputPath 省略时写到规格文件同名的 .glb。用户要文件时优先用这个。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        modelId: { type: "string" },
+        outputPath: { type: "string", description: "绝对路径（.glb）" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
   // ---- 仅 App 页面可见 ----
   {
@@ -656,14 +903,25 @@ async function callTool(name, args) {
       const references = workspace.plates
         .map(p => ({ plateId: p.id, plateName: p.name, items: p.items.filter(i => i.modelId === model.id) }))
         .filter(r => r.items.length)
-      const info = { ...summary(model), references, exportCaches: workspace.plates.filter(p => exportCaches.has(p.id)).map(p => ({ plateId: p.id, plateName: p.name, sizeBytes: exportCaches.get(p.id).bytes.length, updatedAt: exportCaches.get(p.id).updatedAt })) }
+      const info = {
+        ...summary(model), references,
+        revision: model.revision ?? 1,
+        ...(model.format === "spec" ? {
+          partCount: model.spec?.parts?.length ?? 0,
+          parts: (model.spec?.parts ?? []).map(p => `${p.id ?? ""}:${p.primitive}`).slice(0, 60),
+          gates: model.spec?.gates ?? null,
+          snapshots: snapshotBrief(model),
+          lastChange: model.lastChange ?? null,
+        } : {}),
+        exportCaches: workspace.plates.filter(p => exportCaches.has(p.id)).map(p => ({ plateId: p.id, plateName: p.name, sizeBytes: exportCaches.get(p.id).bytes.length, updatedAt: exportCaches.get(p.id).updatedAt })),
+      }
       return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }], structuredContent: info }
     }
     case "export_model": {
       const plate = resolvePlate(args)
       const result = await writePlateExport(plate, args.outputPath)
       return {
-        content: [{ type: "text", text: `盘「${plate.name}」已统一导出为 GLB：${result.path}（${(result.sizeBytes / 1024).toFixed(0)} KB，${plate.items.length} 个对象）。` }],
+        content: [{ type: "text", text: `盘「${plate.name}」已统一导出为 GLB：${result.path}（${(result.sizeBytes / 1024).toFixed(0)} KB，${plate.items.length} 个对象，来自${result.via === "geometry-kernel" ? "服务端几何内核（无需打开页面）" : result.via === "source-glb" ? "原始文件直拷" : "页面同步缓存"}）。` }],
         structuredContent: { ...result, plateId: plate.id, plateName: plate.name },
       }
     }
@@ -674,25 +932,37 @@ async function callTool(name, args) {
     case "agent_create_model": {
       const parts = validateParts(args.parts)
       const name = String(args.name ?? "").trim().slice(0, 64) || "AI 模型"
-      const spec = { specVersion: 1, up: "y", name, description: String(args.description ?? "").slice(0, 500), parts }
+      const spec = { specVersion: 2, up: "y", name, description: String(args.description ?? "").slice(0, 500), parts }
+      if (args.gates) spec.gates = validateGates(args.gates)
       await mkdir(GENERATED_DIR, { recursive: true })
       const safe = name.replace(/[^\w\u4e00-\u9fa5.-]+/g, "_") || "model"
       const file = path.join(GENERATED_DIR, `${safe}-${Date.now().toString(36)}.spec.json`)
       await writeFile(file, JSON.stringify(spec, null, 1), "utf8")
       const model = registerSpec(name, file, spec)
+      pushSnapshot(model, "初始生成")
+      const first = kernel ? safeGateReport(() => kernel.check(spec, spec.gates ?? {}, { bins: 16, exact: false })) : null
       return {
-        content: [{ type: "text", text: `已用 ${parts.length} 个图元生成模型「${name}」（规格 ${(model.sizeBytes / 1024).toFixed(1)} KB）。建模工作台将导入该模型，用户可选择并入当前盘或新建盘。可随时用 agent_modify_model 调整图元，export_model 导出 GLB。` }],
-        structuredContent: { model: summary(model), models: modelList(), activeModelId: model.id, workspace, importHint: { plateName: name } },
+        content: [{ type: "text", text: `已用 ${parts.length} 个图元生成模型「${name}」（规格 ${(model.sizeBytes / 1024).toFixed(1)} KB）。建模工作台将导入该模型，用户可选择并入当前盘或新建盘。下一步请用 inspect_model 看形状、check_gates 过门，不达标就 agent_modify_model 继续调；export_model/save_model_glb 导出 GLB。${first ? `\n首次数值自检：${first.brief}` : ""}` }],
+        structuredContent: {
+          model: summary(model), models: modelList(), activeModelId: model.id, workspace,
+          importHint: { plateName: name },
+          ...(first ? { selfCheck: first.result } : {}),
+        },
       }
     }
     case "agent_modify_model": {
       const operations = Array.isArray(args.operations) ? args.operations : []
       if (operations.length < 1 || operations.length > 100) throw new Error("operations 必须是 1–100 个操作。")
+      const dryRun = args.dryRun === true
       const specModel = args.modelId ? resolveModel(args.modelId) : null
+      // 一律先在副本上算：dryRun 时不写回，正常执行时先快照再落盘
+      const isSpec = !!specModel && specModel.format === "spec" && !!specModel.spec?.parts?.length
+      const draft = isSpec ? JSON.parse(JSON.stringify(specModel.spec)) : null
+      const ws = dryRun ? JSON.parse(JSON.stringify(workspace)) : workspace
       let specChanged = false
       const touchedItems = new Set()
       const findItem = itemId => {
-        for (const plate of workspace.plates) {
+        for (const plate of ws.plates) {
           const item = plate.items.find(i => i.id === itemId)
           if (item) return { plate, item }
         }
@@ -705,8 +975,8 @@ async function callTool(name, args) {
           case "removePart":
           case "setPart": {
             if (!specModel) throw new Error(`${op.op} 需要 modelId 指向 AI 生成的模型。`)
-            if (specModel.format !== "spec") throw new Error(`模型「${specModel.name}」不是 AI 生成的图元模型，无法编辑图元；可改用 moveItem/rotateItem/scaleItem 等对象操作。`)
-            const parts = specModel.spec.parts
+            if (!draft) throw new Error(`模型「${specModel.name}」不是 AI 生成的图元模型，无法编辑图元；可改用 moveItem/rotateItem/scaleItem 等对象操作。`)
+            const parts = draft.parts
             if (op.op === "addPart") {
               if (parts.length >= MAX_PARTS) throw new Error(`图元数量已达 ${MAX_PARTS} 上限。`)
               const part = validatePart(op.part, parts.length)
@@ -720,8 +990,23 @@ async function callTool(name, args) {
             } else {
               const idx = parts.findIndex(p => p.id === op.partId)
               if (idx === -1) throw new Error(`图元「${op.partId}」不存在。`)
-              parts[idx] = validatePart({ ...parts[idx], ...op, id: parts[idx].id }, idx)
+              const patch = { ...parts[idx], ...op, id: parts[idx].id }
+              if (op.mergeParams) patch.params = { ...(parts[idx].params ?? {}), ...(op.params ?? {}) }
+              parts[idx] = validatePart(patch, idx)
             }
+            specChanged = true
+            break
+          }
+          case "setGates": {
+            if (!specModel || !draft) throw new Error("setGates 需要 modelId 指向 AI 生成的 spec 模型。")
+            draft.gates = op.gates ? validateGates(op.gates) : undefined
+            if (!draft.gates) delete draft.gates
+            specChanged = true
+            break
+          }
+          case "setDescription": {
+            if (!specModel || !draft) throw new Error("setDescription 需要 modelId 指向 AI 生成的 spec 模型。")
+            draft.description = String(op.description ?? "").slice(0, 500)
             specChanged = true
             break
           }
@@ -750,7 +1035,7 @@ async function callTool(name, args) {
           }
           case "addItem": {
             const model = resolveModel(String(op.modelId ?? ""))
-            const plate = op.plateId ? workspace.plates.find(p => p.id === op.plateId) : (workspace.plates.find(p => p.id === workspace.activePlateId) ?? workspace.plates[0])
+            const plate = op.plateId ? ws.plates.find(p => p.id === op.plateId) : (ws.plates.find(p => p.id === ws.activePlateId) ?? ws.plates[0])
             if (!plate) throw new Error("还没有盘：请先导入或生成一个模型。")
             if (plate.items.length >= 500) throw new Error("盘内对象已达 500 上限。")
             const item = {
@@ -768,25 +1053,200 @@ async function callTool(name, args) {
         }
       }
       if (specChanged) {
-        specModel.spec.parts.forEach(validatePart)
-        const jsonText = JSON.stringify(specModel.spec)
-        await writeFile(specModel.sourcePath, jsonText, "utf8")
-        specModel.bytes = Buffer.from(jsonText, "utf8")
-        specModel.sizeBytes = specModel.bytes.length
-        specModel.revision = (specModel.revision ?? 1) + 1
+        draft.parts.forEach(validatePart)
+        if (!dryRun) {
+          pushSnapshot(specModel, args.reason || `修改前：${operations.map(o => o.op).slice(0, 6).join("+")}`)
+          specModel.spec = draft
+          await persistSpec(specModel, String(args.reason || "agent_modify_model").slice(0, 120))
+        }
       }
+      const gateReport = draft && kernel ? safeGateReport(() => kernel.check(draft, draft.gates ?? {}, { bins: 16, exact: false })) : null
       const changed = [
-        specChanged ? `模型「${specModel.name}」更新到 r${specModel.revision}` : null,
+        specChanged
+          ? (dryRun ? `模型「${specModel.name}」若写回将变成 ${draft.parts.length} 个图元（未落盘）` : `模型「${specModel.name}」更新到 r${specModel.revision}`)
+          : null,
         touchedItems.size ? `调整了 ${touchedItems.size} 个盘对象` : null,
       ].filter(Boolean).join("，") || "无实际变更"
       return {
-        content: [{ type: "text", text: `已执行 ${operations.length} 个操作：${changed}。工作台将自动刷新，export_model 导出会包含这些修改。` }],
+        content: [{
+          type: "text",
+          text: `${dryRun ? "试算（未写回）" : "已执行"} ${operations.length} 个操作：${changed}。${gateReport ? `\n数值门：${gateReport.brief}` : ""}工作台将自动刷新，export_model/save_model_glb 导出会包含这些修改。`,
+        }],
         structuredContent: {
-          ok: true,
+          ok: true, dryRun,
           ...(specModel ? { model: summary(specModel) } : {}),
-          models: modelList(), activeModelId, workspace,
-          ...(specChanged ? { reloadSpecs: [specModel.id] } : {}),
+          models: modelList(), activeModelId,
+          ...(dryRun ? {} : { workspace }),
+          ...(gateReport ? { gates: gateReport.result } : {}),
+          ...(specChanged && !dryRun ? { reloadSpecs: [specModel.id], snapshots: snapshotBrief(specModel) } : {}),
         },
+      }
+    }
+    case "inspect_model": {
+      const k = needKernel()
+      const model = resolveModel(args.modelId)
+      const spec = specOf(model)
+      const mode = ["summary", "full", "outline"].includes(args.mode) ? args.mode : "summary"
+      const views = (Array.isArray(args.views) ? args.views : []).map(v => String(v)).filter(v => k.VIEWS[v]).slice(0, 4)
+      const size = clampInt(args.size, 96, 384, 224)
+      const bins = clampInt(args.bins, 6, 40, 12)
+      const gates = args.gates ? validateGates(args.gates) : undefined
+      const t0 = Date.now()
+      const out = k.inspect(spec, { mode, views, size, bins, gates })
+      const n = out.numeric
+      const mm = v => (v * 1000).toFixed(1)
+      const series = s => s.map(x => `${mm(x.at)}:${mm(x.width)}`).join(" ")
+      const lines = [
+        `模型「${model.name}」r${model.revision ?? 1}｜${n.partCount} 个图元｜${n.triCount} 三角面｜内核${out.cached ? "缓存命中" : "求值"} ${Date.now() - t0}ms｜hash ${out.hash}`,
+        `尺寸 X×Y×Z = ${n.sizeMm[0]} × ${n.sizeMm[1]} × ${n.sizeMm[2]} mm`,
+        `包围盒 min [${n.bbox.min.map(v => mm(v)).join(", ")}] max [${n.bbox.max.map(v => mm(v)).join(", ")}] mm`,
+        `地面：最低点 ${mm(n.ground.minY)}mm（贴地应为 0）｜最高点 ${mm(n.ground.maxY)}mm`,
+        `俯视轮廓 z→宽(mm)：${series(n.silhouette.top) || "（无）"}`,
+        `侧视轮廓 y→深(mm)：${series(n.silhouette.side) || "（无）"}`,
+      ]
+      if (mode === "full") {
+        lines.push("部件：" + (n.parts ?? []).map(p => `${p.id}[${p.primitive}] ${p.sizeMm.map(v => Math.round(v)).join("×")}mm@(${p.center.map(v => mm(v)).join(",")})${p.triCount}面`).join("；"))
+        lines.push("重叠对：" + ((n.overlaps ?? []).length ? (n.overlaps ?? []).map(o => `${o.a}×${o.b}${o.overlapMm3 ? ` ${o.overlapMm3}mm³` : ""}`).join("，") : "无"))
+      }
+      if (out.gates) {
+        lines.push("门：" + (out.gates.results.length ? out.gates.results.map(r => `${r.gate} ${r.ok ? "达标" : "未达标 " + r.note}`).join("；") : "模型未定义门") + `（代价 ${out.gateError ?? 0}）`)
+      }
+      if (!views.length) lines.push("提示：加 views:[\"top\",\"side\",\"iso\"] 可直接拿到视图图片来判断形状。")
+      const content = [{ type: "text", text: lines.join("\n") }]
+      for (const img of out.images ?? []) {
+        content.push({ type: "text", text: `视图 ${img.view}（${img.desc}，${img.size}px / ${img.bytes}B）` })
+        content.push({ type: "image", data: img.base64, mimeType: "image/png" })
+      }
+      const { images, ...rest } = out
+      return { content, structuredContent: { ...rest, images: (images ?? []).map(({ base64, ...r }) => r), modelId: model.id, revision: model.revision ?? 1 } }
+    }
+    case "check_gates": {
+      const k = needKernel()
+      const model = resolveModel(args.modelId)
+      const spec = specOf(model)
+      const incoming = args.gates ? validateGates(args.gates) : null
+      const gates = incoming ?? spec.gates
+      if (!gates) throw new Error("模型还没有验收门。传 gates（dimension/ground/silhouette/clearance/parts/custom）即可同时存入规格，之后每次修改都会用它兜底。")
+      const bins = clampInt(args.bins, 8, 40, 24)
+      const t0 = Date.now()
+      const res = k.check(spec, gates, { bins, exact: args.exact === true })
+      let persisted = false
+      if (incoming && args.persist !== false) {
+        pushSnapshot(model, "改验收门前")
+        spec.gates = gates
+        await persistSpec(model, "check_gates 写入验收门")
+        persisted = true
+      }
+      const brief = res.results.length
+        ? (res.ok ? `全部达标：${res.results.map(r => r.gate).join("、")}` : res.results.map(r => `${r.gate} ${r.ok ? "达标" : "未达标 → " + r.note}`).join("；"))
+        : "没有可执行的门"
+      return {
+        content: [{ type: "text", text: `验收门 ${res.ok ? "全部通过" : "未通过"}（代价 ${res.err}，尺寸 ${res.sizeMm.join("×")}mm，${Date.now() - t0}ms${persisted ? "，新门已写入规格" : ""}）：\n${brief}` }],
+        structuredContent: { ok: res.ok, ...res, persisted, modelId: model.id, revision: model.revision ?? 1, ...(persisted ? { reloadSpecs: [model.id] } : {}) },
+      }
+    }
+    case "optimize_params": {
+      const k = needKernel()
+      const model = resolveModel(args.modelId)
+      const spec = specOf(model)
+      const incoming = args.gates ? validateGates(args.gates) : null
+      const gates = incoming ?? spec.gates
+      if (!gates) throw new Error("optimize_params 需要 gates 作为目标函数（可传 gates 或先用 check_gates/setGates 存入）。")
+      const rawVars = Array.isArray(args.vars) ? args.vars.slice(0, 12) : []
+      const vars = rawVars.map((v, i) => {
+        const p = String(v?.path ?? "")
+        if (!/^parts\.\d+\.(params\.\w+|position\.\d|rotationDeg\.\d|scale\.\d)$/.test(p)) {
+          throw new Error(`vars[${i}].path 需形如 parts.3.params.radius 或 parts.0.position.1，收到「${p}」。`)
+        }
+        const min = Number(v?.min), max = Number(v?.max)
+        if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) throw new Error(`vars[${i}]（${p}）需要有限的 min < max。`)
+        return { path: p, min, max, start: v?.start === undefined ? undefined : Number(v.start) }
+      })
+      if (!vars.length) throw new Error("vars 至少需要一项。")
+      const budget = clampInt(args.budget, 4, 80, 20)
+      const t0 = Date.now()
+      const r = k.optimize(spec, { gates, vars, budget, bins: clampInt(args.bins, 8, 32, 16), seed: clampInt(args.seed, 1, 99999, 1) })
+      const applied = args.apply === true && r.ok
+      if (applied) {
+        pushSnapshot(model, "搜索写回前")
+        model.spec = r.spec
+        await persistSpec(model, `optimize_params（${r.steps} 次评估）`)
+      }
+      const rd = v => (typeof v === "number" ? Number(v.toFixed(5)) : v)
+      const valueText = r.values.map(v => `${v.path.replace(/^parts\./, "部件")} ${rd(v.from)}→${rd(v.to)}`).join("，") || "无可调项生效"
+      return {
+        content: [{
+          type: "text",
+          text: `${r.ok ? "搜索达标" : "未达标（代价 " + r.err + "）"}：${r.steps} 次评估 / ${Date.now() - t0}ms。参数变动 ${valueText}。${applied ? `已写回，当前 r${model.revision}（可 revert_model 回滚）。` : args.apply ? "apply=true 但仍未达标，未写回。" : "未写回；认可结果可再调用一次带 apply:true。"}`,
+        }],
+        structuredContent: {
+          ok: r.ok, err: r.err, steps: r.steps, values: r.values, ms: Date.now() - t0, applied,
+          gates: r.check, modelId: model.id, revision: model.revision ?? 1,
+          ...(applied ? { reloadSpecs: [model.id], snapshots: snapshotBrief(model) } : {}),
+        },
+      }
+    }
+    case "snapshot_model": {
+      const model = resolveModel(args.modelId)
+      specOf(model)
+      pushSnapshot(model, args.reason || "手动存档")
+      return {
+        content: [{ type: "text", text: `已为「${model.name}」存档 r${model.revision}（现有 ${model.snapshots.length} 份快照，序号 1 = 最旧，最多 ${SNAPSHOT_MAX} 份）。` }],
+        structuredContent: { ok: true, snapshots: snapshotBrief(model), modelId: model.id },
+      }
+    }
+    case "revert_model": {
+      const model = resolveModel(args.modelId)
+      specOf(model)
+      const snaps = model.snapshots ?? []
+      if (args.list === true) {
+        return { content: [{ type: "text", text: snaps.length ? `「${model.name}」有 ${snaps.length} 份快照：\n` + snaps.map((s, i) => `${i + 1}. r${s.rev} ${new Date(s.at).toISOString().slice(0, 19).replace("T", " ")} ${s.reason}（${s.spec?.parts?.length ?? 0} 图元）`).join("\n") : "还没有快照。" }], structuredContent: { snapshots: snapshotBrief(model) } }
+      }
+      if (!snaps.length) throw new Error(`「${model.name}」还没有可回滚的快照（每次写回都会自动存一份，最多 ${SNAPSHOT_MAX}）。`)
+      if (args.index !== undefined && args.index !== null) {
+        const want = clampInt(args.index, 1, 999, 1)
+        if (want < 1 || want > snaps.length) throw new Error(`没有第 ${want} 号快照（现有 ${snaps.length} 份，1 = 最旧）。`)
+      }
+      const index = args.index ? snaps.length - clampInt(args.index, 1, snaps.length, 1) : snaps.length - 1
+      const snap = snaps[index]
+      if (!snap) throw new Error(`快照 ${index + 1} 读取失败。`)
+      pushSnapshot(model, `回滚到 r${snap.rev} 前自动存档`)
+      model.spec = JSON.parse(JSON.stringify(snap.spec))
+      await persistSpec(model, `revert_model → 快照 ${index + 1}（r${snap.rev}）`)
+      const res = kernel ? safeGateReport(() => kernel.check(model.spec, model.spec.gates ?? {}, { bins: 16, exact: false })) : null
+      return {
+        content: [{ type: "text", text: `已回滚「${model.name}」到快照 ${index + 1}（原 r${snap.rev}，${model.spec.parts.length} 个图元），现版本 r${model.revision}。回滚前也存了快照，可再次 revert_model 回来。${res ? `\n回滚后自检：${res.brief}` : ""}` }],
+        structuredContent: {
+          ok: true, model: summary(model), snapshots: snapshotBrief(model), reloadSpecs: [model.id], workspace,
+          ...(res ? { gates: res.result } : {}),
+        },
+      }
+    }
+    case "save_model_glb": {
+      const k = needKernel()
+      const model = resolveModel(args.modelId)
+      const spec = specOf(model)
+      const bytes = await k.toGlb(spec)
+      let target
+      if (args.outputPath) {
+        target = path.resolve(String(args.outputPath))
+        if (!path.isAbsolute(target)) throw new Error("outputPath 必须是绝对路径。")
+      } else {
+        const parsed = path.parse(model.sourcePath)
+        let dir = path.dirname(model.sourcePath)
+        const lower = dir.toLowerCase()
+        if (lower.startsWith(IMPORT_DIR.toLowerCase()) || lower.startsWith(GENERATED_DIR.toLowerCase())) {
+          dir = userDesktop() || (process.env.USERPROFILE || process.env.HOME || process.cwd())
+        }
+        target = path.join(dir, `${parsed.name.replace(/\.spec$/i, "")}.glb`)
+      }
+      if (target.toLowerCase() === (model.sourcePath ?? "").toLowerCase()) throw new Error("导出目标与源文件相同，请换一个路径。")
+      if (!/\.glb$/i.test(target)) target += ".glb"
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(target, bytes)
+      return {
+        content: [{ type: "text", text: `已用服务端内核把「${model.name}」直出为 GLB：${target}（${(bytes.length / 1024).toFixed(0)} KB）。` }],
+        structuredContent: { ok: true, path: target, sizeBytes: bytes.length, modelId: model.id },
       }
     }
     case "update_workspace_state": {
@@ -921,6 +1381,7 @@ async function handle(request) {
               extensions: { "qoder/settings": { readTool: "settings_read", updateTool: "settings_update" } },
             },
             serverInfo: SERVER_INFO,
+            instructions: "建模工作台：3D 预览 + 参数化 spec 建模 + 服务端几何内核。Agent 建模闭环（不要凭想象交付）：1) agent_create_model 生成 parts（Y-up、米、地面 y=0，可同时给 gates）；2) inspect_model 读尺寸/轮廓数值，需要看形状时带 views:[\"top\",\"side\",\"iso\"] 取正交图；3) check_gates 做数值验收（dimension/ground/silhouette/clearance/parts），写入的 gates 是后续每次修改的底线；4) 未达标就 agent_modify_model（可 dryRun 先看代价）或 optimize_params 让工具在本地反复试参、只回最优；5) save_model_glb/export_model 出文件（spec 盘无需页面在场）；6) open_viewer 让用户在窗口里看。每次写回都会自动快照，改坏了用 revert_model。",
           },
         })
       }

@@ -1,0 +1,13 @@
+{
+  "name": "model-studio-build",
+  "private": true,
+  "type": "module",
+  "description": "Build-time only dependencies for the model-studio viewer bundle. The shipped plugin has no runtime npm dependencies.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "three": "^0.180.0"
+  }
+}

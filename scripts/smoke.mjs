@@ -58,10 +58,11 @@ try {
   })
   check("initialize 协商", init.result?.protocolVersion === "2025-11-25")
   check("settings 扩展声明", init.result?.capabilities?.extensions?.["qoder/settings"]?.readTool === "settings_read")
+  check("服务器 instructions 交代建模闭环", /inspect_model/.test(init.result?.instructions ?? "") && /check_gates/.test(init.result?.instructions ?? ""))
 
   const toolList = (await rpc("tools/list", {})).result.tools
   const names = toolList.map(t => t.name)
-  check("工具齐全", ["open_model", "export_model", "list_models", "get_workspace", "get_model_info", "list_adapters", "agent_create_model", "agent_modify_model", "open_viewer", "load_local_file", "upload_import_chunk", "commit_import", "update_workspace_state", "upload_export_chunk", "save_export_to_path", "settings_read", "settings_update"].every(n => names.includes(n)))
+  check("工具齐全", ["open_model", "export_model", "list_models", "get_workspace", "get_model_info", "list_adapters", "agent_create_model", "agent_modify_model", "open_viewer", "load_local_file", "upload_import_chunk", "commit_import", "update_workspace_state", "upload_export_chunk", "save_export_to_path", "settings_read", "settings_update", "inspect_model", "check_gates", "optimize_params", "snapshot_model", "revert_model", "save_model_glb"].every(n => names.includes(n)))
   const openViewer = toolList.find(t => t.name === "open_viewer")
   check("入口声明 global+thread", JSON.stringify(openViewer._meta["qoder/ui"].entrypoints) === JSON.stringify([{ type: "global" }, { type: "thread" }]))
   check("open_viewer 对 Agent 可见", !openViewer._meta.ui.visibility && Boolean(openViewer._meta.ui.resourceUri))
@@ -286,6 +287,92 @@ try {
   check("非 spec 模型图元操作被拒绝", nonSpec.isError === true)
   const badItem = await call("agent_modify_model", { operations: [{ op: "moveItem", itemId: "nope", position: [1, 2, 3] }] })
   check("不存在对象被拒绝", badItem.isError === true)
+  await call("update_workspace_state", { workspace })
+
+  // ---- v0.6 几何内核：观察 / 门控 / 快照 / 搜索 / 直出 ----
+  const kernelSpec = {
+    id: "kernel-table", primitive: "box", params: { width: 0.12, height: 0.04, depth: 0.34 }, position: [0, 0.7, 0], color: "#b87333",
+  }
+  const gatesPass = {
+    dimension: { x: { value: 0.3, tol: 0.004 }, y: { value: 0.04, tol: 0.004 }, z: { value: 0.4, tol: 0.004 } },
+    ground: { tol: 0.001 },
+    parts: { box: 1 },
+  }
+  const gatesFail = { dimension: { x: { value: 0.9, tol: 0.002 } } }
+  const gatesExact = {
+    dimension: { x: { value: 0.12, tol: 0.004 }, y: { value: 0.04, tol: 0.004 }, z: { value: 0.34, tol: 0.004 } },
+    ground: { tol: 0.001 },
+    parts: { box: 1 },
+  }
+  const kn = await call("agent_create_model", { name: "内核台", parts: [kernelSpec], gates: gatesFail })
+  const kid = kn.structuredContent?.model?.id
+  check("内核工具已暴露", ["inspect_model", "check_gates", "optimize_params", "snapshot_model", "revert_model", "save_model_glb"].every(n => names.includes(n)))
+  check("生成时写入门", !kn.isError && kn.structuredContent?.selfCheck?.ok === false && /0.9/.test(JSON.stringify(kn.structuredContent?.selfCheck?.results ?? "")))
+
+  const insp = await call("inspect_model", { modelId: kid, mode: "full", bins: 12, views: ["top", "iso"], size: 128 })
+  const num = insp.structuredContent?.numeric
+  check("inspect_model 数值", !insp.isError && num?.sizeMm?.[0] === 120 && num?.sizeMm?.[2] === 340 && num?.triCount === 12)
+  check("inspect_model 部件与轮廓", insp.structuredContent?.mode === "full" && num.parts?.[0]?.id === "kernel-table" && num.silhouette?.top?.length === 12 && num.silhouette.top.every(s => Math.abs(s.width - 0.12) < 0.006))
+  check("inspect_model 出图", insp.content.some(c => c.type === "image" && c.mimeType === "image/png") && Buffer.from(insp.content.find(c => c.type === "image")?.data ?? "", "base64").subarray(1, 4).toString() === "PNG")
+  check("inspect 结果不重复塞 base64", !JSON.stringify(insp.structuredContent).includes("iVBOR"))
+  const inspBad = await call("inspect_model", { modelId })
+  check("外部文件模型不可内核观察", inspBad.isError === true)
+
+  const gateFailRun = await call("check_gates", { modelId: kid })
+  check("check_gates 判不达标", gateFailRun.isError !== true && gateFailRun.structuredContent?.ok === false && /未登记|≠|0.9/.test(gateFailRun.structuredContent?.results?.[0]?.note ?? ""))
+  const gateBad = await call("check_gates", { modelId: kid, gates: { nonsense: true } })
+  check("非法门定义被拒绝", gateBad.isError === true)
+  const gateSet = await call("check_gates", { modelId: kid, gates: gatesExact })
+  const gateFile = JSON.parse(await readFile(kn.structuredContent.model.sourcePath, "utf8"))
+  check("门写入规格并放行", gateSet.structuredContent?.ok === true && gateSet.structuredContent?.persisted === true && JSON.stringify(gateFile.gates?.dimension?.x) === JSON.stringify({ value: 0.12, tol: 0.004 }))
+  check("门计数与告警齐全", (gateSet.structuredContent?.results ?? []).length === 3 && gateSet.structuredContent.results.every(r => r.ok && "measured" in r && "expected" in r))
+
+  const before = await readFile(kn.structuredContent.model.sourcePath, "utf8")
+  const revBefore = kn.structuredContent.model.revision ?? 1
+  const dry = await call("agent_modify_model", { modelId: kid, dryRun: true, operations: [{ op: "setPart", partId: "kernel-table", params: { width: 0.5 }, mergeParams: true }] })
+  const afterDry = await readFile(kn.structuredContent.model.sourcePath, "utf8")
+  check("dryRun 不落盘", !dry.isError && dry.structuredContent?.dryRun === true && afterDry === before && !dry.structuredContent?.reloadSpecs)
+  check("dryRun 仍报门", dry.structuredContent?.gates?.ok === false && JSON.stringify(dry.structuredContent?.gates?.results?.[0]?.measured).includes("500"))
+
+  const mutate = await call("agent_modify_model", { modelId: kid, reason: "加底板", operations: [
+    { op: "addPart", part: { id: "base", primitive: "box", params: { width: 0.3, height: 0.66, depth: 0.4 }, position: [0, 0.33, 0], color: "#8899aa" } },
+    { op: "setPart", partId: "kernel-table", params: { width: 0.3 }, mergeParams: true },
+  ] })
+  const snapsAfterMutate = mutate.structuredContent?.snapshots ?? []
+  check("写回前自动快照", !mutate.isError && snapsAfterMutate.length >= 1 && snapsAfterMutate.at(-1).reason?.includes("加底板"))
+  check("mergeParams 只改给出的键", JSON.parse(await readFile(kn.structuredContent.model.sourcePath, "utf8")).parts.find(p => p.id === "kernel-table").params.depth === 0.34)
+  const reverted = await call("revert_model", { modelId: kid })
+  const backSpec = JSON.parse(await readFile(kn.structuredContent.model.sourcePath, "utf8"))
+  check("revert_model 回到旧版", !reverted.isError && backSpec.parts.length === 1 && reverted.structuredContent?.reloadSpecs?.[0] === kid && (reverted.structuredContent.model.revision ?? 0) > revBefore)
+  const listAgain = await call("revert_model", { modelId: kid, list: true })
+  check("快照可列举", (listAgain.structuredContent?.snapshots ?? []).length >= 2)
+  const manual = await call("snapshot_model", { modelId: kid, reason: "手动存档" })
+  check("snapshot_model 上限", !manual.isError && manual.structuredContent.snapshots.length <= 8)
+  const noSnap = await call("revert_model", { modelId: kid, index: 99 })
+  check("越界快照序号被拒", noSnap.isError === true)
+
+  const offSpec = await call("agent_create_model", { name: "待搜型", parts: [{ id: "b", primitive: "box", params: { width: 0.12, height: 0.04, depth: 0.34 }, position: [0, 0.7, 0] }], gates: gatesPass })
+  const oid = offSpec.structuredContent?.model?.id
+  const opt = await call("optimize_params", { modelId: oid, vars: [
+    { path: "parts.0.params.width", min: 0.1, max: 0.6 },
+    { path: "parts.0.params.depth", min: 0.2, max: 0.55 },
+  ], budget: 16, seed: 3, apply: true })
+  const optSpec = JSON.parse(await readFile(offSpec.structuredContent.model.sourcePath, "utf8"))
+  check("optimize_params 收敛并写回", !opt.isError && opt.structuredContent?.ok === true && opt.structuredContent?.applied === true && opt.structuredContent.steps > 1)
+  check("optimize 结果在容差内", Math.abs(optSpec.parts[0].params.width - 0.3) <= 0.004 && Math.abs(optSpec.parts[0].params.depth - 0.4) <= 0.004)
+  check("optimize 不把整份 spec 塞回对话", !opt.structuredContent?.spec && !JSON.stringify(opt.structuredContent).includes('"params"'))
+  const optBad = await call("optimize_params", { modelId: oid, vars: [{ path: "parts.0.color", min: 0, max: 1 }] })
+  check("非法搜索变量被拒", optBad.isError === true)
+
+  const glbOut = path.join(tmp, "kernel-export.glb")
+  const saved = await call("save_model_glb", { modelId: kid, outputPath: glbOut })
+  const savedBytes = existsSync(glbOut) ? await readFile(glbOut) : null
+  check("save_model_glb 服务端直出", !saved.isError && savedBytes?.subarray(0, 4).toString() === "glTF" && savedBytes.length > 1000)
+  const plateSpecOnly = { plates: [{ id: "plate-kernel", name: "内核盘", visible: true, items: [{ id: "k-item", modelId: kid, name: "内核台", position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], visible: true }] }], activePlateId: "plate-kernel" }
+  await call("update_workspace_state", { workspace: plateSpecOnly })
+  const directExport = await call("export_model", { plateId: "plate-kernel", outputPath: path.join(tmp, "plate-kernel.glb") })
+  const directBytes = existsSync(directExport.structuredContent?.path ?? "") ? await readFile(directExport.structuredContent.path) : null
+  check("纯 spec 盘免页面导出", !directExport.isError && directExport.structuredContent?.via === "geometry-kernel" && directBytes?.subarray(0, 4).toString() === "glTF")
   await call("update_workspace_state", { workspace })
 
   // ---- 错误路径 ----

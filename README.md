@@ -9,7 +9,9 @@ Qoder 插件：让 Agent 在窗口中显示 3D 建模内容。多种建模格式
 - **多入口导入**：对话区点击模型深链接自动打开工作台并导入；点击免路径链接 `[打开建模工作台](qoder-cn://plugins/model-studio%40local/app/open_viewer)` 只调起视图并导入最近的模型（`?path=/model/<modelId>` 指定已注册模型，无需磁盘路径）；从桌面拖拽文件到工作台导入（沙箱页面读不到 `File.path` 时自动改为读取文件字节分块上传到服务器再注册，无需宿主拖放通知）；“打开文件”/路径输入；Agent 调用 `open_model`（`path` 可省略）。
 - **简单编辑**：点选对象后 gizmo 或数值输入移动/旋转/缩放；右键菜单与右侧固定属性表支持设置原点（几何中心/底面中心/世界原点）、复制（立即粘贴到相同位置）、删除（可撤销）、重置变换、可见性。选中后拖动视角不会丢失选择。快捷键 F/G/R/S/Ctrl+D/Delete/Esc。
 - **视图与渲染**：左侧盘大纲与右侧属性表均可在任意窗口宽度下用顶栏按钮收起/展开，避免遮挡盘画面；轨道/平移/缩放、正/顶/侧/等轴预设、适配视图、Y-up/Z-up 切换；右上角坐标球点击轴切换视角；渲染控制区（主光强度/方位、环境光、曝光、视场角、自动旋转、画质、主题、网格/线框/坐标球）即时生效。
-- **统一输出 GLB**：页面“导出 GLB”按当前盘下载或保存到指定路径；Agent 调用 `export_model { plateId? / modelId? }` 落盘（含用户编辑，自动避开源文件）。编辑后页面自动把工作区与 GLB 同步到服务器缓存。
+- **统一输出 GLB**：页面“导出 GLB”按当前盘下载或保存到指定路径；Agent 调用 `export_model { plateId? / modelId? }` 落盘（含用户编辑，自动避开源文件），`save_model_glb { modelId?, outputPath? }` 由服务端内核直接从 spec 组装 GLB 写盘（全 spec 的盘无需页面在场）。编辑后页面自动把工作区与 GLB 同步到服务器缓存。
+- **服务端几何内核（0.6）**：浏览器与 Node 共用同一份图元实现（`src/spec.js` + `src/analysis.js`），由 esbuild 打成 `lib/geometry.node.mjs` 供 `server.mjs` 同步调用，不依赖页面是否打开。能力包括：三角剖分与逐部件包围盒、CPU 正交光栅化（z-buffer + Lambert 着色）导出 PNG 正交图、俯视/侧视轮廓宽度采样、部件两两相交体积（Möller SAT 精确三角对 + 空间哈希剪枝，超预算自动降级为 AABB 并标注）、按 spec 哈希的 LRU 求值缓存。
+- **感知与数值验收**：`inspect_model`（尺寸/包围盒/最低点/部件表/轮廓数组，可带 `views` 取正交图）、`check_gates`（`dimension` / `ground` / `silhouette` / `clearance` / `parts` / `custom` 六类门，逐条给出 `measured` 与 `expected`，可 `persist` 写入 `spec.gates` 成为后续修改的底线）、`optimize_params`（服务端随机撒点 + 三轮坐标下降，只回最优参数，试错过程不进入对话，可 `dryRun` / `apply`）、`snapshot_model` / `revert_model`（每次写回自动快照，环形保留 8 条，修订号可见）。
 - **Blender 版本适配**：自动探测版本（2.80–4.x+）；导入操作符按候选列表探测（`wm.*_import` vs `import_scene.*`），导入/导出参数按当前版本 RNA 属性过滤，跨版本参数改名不会导致失败。低于 2.80 给出明确升级提示。
 - **其他建模软件接入**：设置中指定自定义适配器 JSON（`command` 直接命令行 / `script` 脚本式，占位符 `{input}` `{output}` `{report}` `{script}`），任何能输出 GLB 的工具都可接入。示例见 `examples/adapters.example.json` 与 `lib/freecad_convert.py`（FreeCAD 示例脚本，未在所有版本验证）。
 - **Agent 协作**：`get_workspace` 读取完整盘场景，`get_model_info` 读取模型被哪些盘引用；页面“询问 AI”把当前盘上下文发送到对话；Skill 指导 Agent 为模型文件生成可点击导入的深链接。
@@ -21,8 +23,9 @@ Qoder 插件：让 Agent 在窗口中显示 3D 建模内容。多种建模格式
 | --- | --- |
 | MCP 服务器 `server.mjs` | stdio JSON-RPC，无第三方运行时依赖 |
 | MCP App 页面 `ui/` + `src/` | three.js 查看器，esbuild 打包为自包含脚本内联进 HTML |
+| 几何内核 `src/spec.js` · `src/analysis.js` · `src/kernel.mjs` → `lib/geometry.node.mjs` | 浏览器与 Node 共用的图元展开、正交栅格化、轮廓采样、相交检测、门校验、参数寻优、GLB 直出 |
 | 适配层 `lib/adapters.mjs` | 配置、Blender 探测、转换调度、自定义适配器 |
-| Skill `skills/model-studio/` | 指导 Agent 使用工具与配置 |
+| Skill `skills/model-studio/` | 指导 Agent 使用工具与配置（含感知—验收闭环规则） |
 | 设置扩展 `qoder/settings` | 设置表单：Blender 路径 / 适配器文件 / 转换超时 |
 
 入口：左侧“更多”与会话右侧应用菜单中的“建模视图”（global + thread）；模型调用 `open_model` 默认在独立视图打开。
@@ -58,12 +61,21 @@ Qoder 插件：让 Agent 在窗口中显示 3D 建模内容。多种建模格式
 ## 开发与验证
 
 ```sh
-cd build && npm install && node build.mjs   # 重新打包查看器（仅构建时需要 npm）
-node scripts/smoke.mjs                      # 服务器协议冒烟测试（70 项）
-node scripts/make-page-test.mjs             # 生成浏览器端页面测试 harness
+cd build && npm install && node build.mjs       # 重新打包浏览器查看器（仅构建时需要 npm）
+node build/build-node.mjs                       # 重新打包服务端内核 lib/geometry.node.mjs 并跑内核自检
+node scripts/smoke.mjs                          # 服务器协议冒烟测试（含 0.6 内核用例）
+node scripts/make-page-test.mjs                 # 生成浏览器端页面测试 harness
+node src/kernel.mjs inspect mouse-spec.json     # 单独调试内核（inspect/check/png）
+node scripts/pack.mjs                          # 打包安装 ZIP（版本取自 plugin.json，条目名正斜杠，排除构建缓存）
+node scripts/github-push.mjs --dry-run         # 与远端仓库比对差异（只读，无需 token）
+GH_TOKEN=<PAT> node scripts/github-push.mjs    # 发布到 GitHub：新增+修改文件合成一次普通提交推上 main
 ```
 
-在 Qoder 中人工验证：安装启用后让模型调用 `open_model` 加载一个 GLB/STL；确认独立视图打开、编辑模式 gizmo 可用、导出 GLB 可打开；配置 Blender 后加载 `.blend` 验证转换。
+发布清单由 `scripts/release-files.mjs` 统一维护，`pack.mjs` 与 `github-push.mjs` 共用同一份白名单，保证 ZIP 与仓库内容一致（`ui/viewer.bundle.js`、`lib/geometry.node.mjs` 虽是构建产物，但刻意随仓库发布，clone 即可作为插件安装）。`github-push.mjs` 走 GitHub REST 的 blobs → tree → commit → ref 流程，按 git blob SHA 跳过未变化文件，父提交取远端当前 `main`、不改写历史；之所以提供它，是因为部分网络环境只放行 `api.github.com`，`git push` 的 github.com transport 会在 TLS 握手阶段失败——那种环境下它就是唯一的发布通道。
+
+在 Qoder 中人工验证：安装启用后让模型调用 `open_model` 加载一个 GLB/STL；确认独立视图打开、编辑模式 gizmo 可用、导出 GLB 可打开；配置 Blender 后加载 `.blend` 验证转换；对 AI 生成的 spec 模型跑一遍 `inspect_model → check_gates → optimize_params → save_model_glb → revert_model` 确认内核链路。
+
+两个 bundle 都必须先构建再打包：`ui/viewer.bundle.js` 内联进 `viewer.html`，`lib/geometry.node.mjs` 缺失时 `server.mjs` 仍能预览/导出页面缓存，但 `inspect_model` / `check_gates` / `optimize_params` / `save_model_glb` 会返回明确的“内核不可用”提示。
 
 ## 目录结构
 
@@ -72,11 +84,12 @@ model-studio/
 ├── .qoder-plugin/plugin.json
 ├── .mcp.json
 ├── server.mjs
-├── lib/            adapters.mjs · blender_convert.py · freecad_convert.py（示例）
+├── lib/            adapters.mjs · geometry.node.mjs（内核构建产物）· blender_convert.py · freecad_convert.py（示例）
 ├── ui/             viewer.html · viewer.bundle.js（构建产物，随包分发）
-├── src/            main.js · loaders.js · host.js（页面源码）
-├── build/          build.mjs · package.json（仅构建用）
+├── src/            main.js · loaders.js · host.js · spec.js · analysis.js · kernel.mjs
+├── build/          build.mjs · build-node.mjs · package.json（仅构建用）
+├── docs/           blender-tcp-outline.md（Blender 直连方案，未实现）
 ├── skills/model-studio/SKILL.md
 ├── examples/adapters.example.json
-└── scripts/        smoke.mjs · make-page-test.mjs
+└── scripts/        smoke.mjs · check.mjs · pack.mjs · github-push.mjs · release-files.mjs · make-page-test.mjs
 ```
