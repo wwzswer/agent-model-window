@@ -1,4 +1,4 @@
-// 建模工作台 MCP 服务器 v0.3（stdio，无第三方运行时依赖）。
+// 建模工作台 MCP 服务器 v0.5（stdio，无第三方运行时依赖）。
 // 职责：模型文件注册与分块传输、盘（plate）工作区存储、按盘统一 GLB 导出、
 //       建模软件适配调度、插件设置；AI 建模/修改基于参数化图元规格（spec JSON）。
 import { readFile, writeFile, mkdir, stat, readdir, rm } from "node:fs/promises"
@@ -11,7 +11,7 @@ import {
   PLUGIN_ROOT, CACHE_DIR, loadConfig, saveConfig, SETTINGS_SCHEMA, listAdapters, convertToGlb,
 } from "./lib/adapters.mjs"
 
-const SERVER_INFO = { name: "model-studio", version: "0.3.2" }
+const SERVER_INFO = { name: "model-studio", version: "0.5.0" }
 const UI_URI = "ui://model-studio/viewer.html"
 const BROWSER_FORMATS = ["glb", "gltf", "obj", "stl", "ply", "fbx", "3mf", "dae"]
 const IMPORT_EXTENSIONS = [...BROWSER_FORMATS, "blend", "abc", "usd", "usda", "usdc", "usdz", "x3d", "wrl", "step", "stp", "iges", "igs", "brep"]
@@ -173,7 +173,7 @@ async function registerFile(inputPath) {
 }
 
 // ---------- 参数化图元规格（AI 建模） ----------
-const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid", "torus", "capsule", "plane", "lathe", "tube"]
+const PRIMITIVE_KINDS = ["box", "rounded_box", "sphere", "cylinder", "cone", "pyramid", "torus", "capsule", "plane", "lathe", "tube", "sweep", "extrude", "heightfield"]
 const GENERATED_DIR = path.join(CACHE_DIR, "generated")
 const MAX_PARTS = 200
 
@@ -189,6 +189,35 @@ function validatePointList(raw, dims, label) {
     return pt.map((v, k) => paramValue(v, -10000, 10000, `${label} 第 ${i + 1} 点第 ${k + 1} 维`))
   })
 }
+function validateSweepProfile(raw, id) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`图元「${id}」：profile 必须是 {shape:"circle"|"rect"|"polygon", …}。`)
+  const shape = String(raw.shape ?? "circle")
+  if (!["circle", "rect", "polygon"].includes(shape)) throw new Error(`图元「${id}」：profile.shape「${shape}」无效（circle/rect/polygon）。`)
+  const out = { shape }
+  if (shape === "circle") {
+    out.radius = paramValue(raw.radius ?? 0.05, 0.0001, 10000, `图元「${id}」profile.radius`)
+    out.segments = Math.round(paramValue(raw.segments ?? 16, 3, 64, `图元「${id}」profile.segments`))
+  } else if (shape === "rect") {
+    out.width = paramValue(raw.width ?? 0.1, 0.0001, 10000, `图元「${id}」profile.width`)
+    out.height = paramValue(raw.height ?? 0.1, 0.0001, 10000, `图元「${id}」profile.height`)
+  } else {
+    if (!Array.isArray(raw.points) || raw.points.length < 3 || raw.points.length > 32) throw new Error(`图元「${id}」：polygon 截面需要 3–32 个点。`)
+    out.points = raw.points.map((pt, i) => {
+      if (!Array.isArray(pt) || pt.length !== 2 || pt.some(v => !Number.isFinite(Number(v)))) throw new Error(`图元「${id}」：polygon 第 ${i + 1} 点必须是 [x,y]。`)
+      return pt.map((v, k) => paramValue(v, -10000, 10000, `图元「${id}」polygon 第 ${i + 1} 点第 ${k + 1} 维`))
+    })
+  }
+  return out
+}
+function validateHeights(raw, id) {
+  if (!Array.isArray(raw) || raw.length < 2 || raw.length > 33) throw new Error(`图元「${id}」：heights 必须是 2–33 行的二维数组。`)
+  const cols = raw[0] instanceof Array ? raw[0].length : -1
+  if (cols < 2 || cols > 33) throw new Error(`图元「${id}」：heights 每行需要 2–33 个数值。`)
+  return raw.map((row, k) => {
+    if (!Array.isArray(row) || row.length !== cols) throw new Error(`图元「${id}」：heights 第 ${k + 1} 行需要 ${cols} 个数值（与首行一致）。`)
+    return row.map((v, i) => paramValue(v, -10000, 10000, `图元「${id}」heights[${k}][${i}]`))
+  })
+}
 function validateColor(value) {
   const s = String(value).trim().replace(/^#?/, "#")
   if (!/^#[0-9a-fA-F]{3,8}$/.test(s)) throw new Error("color 必须是 #rrggbb 形式的颜色。")
@@ -200,19 +229,35 @@ function validatePart(raw, index) {
   const id = String(raw.id ?? `part-${index + 1}`).slice(0, 64)
   const params = {}
   let points = null
+  let profile = null
+  let heights = null
   if (raw.primitive === "lathe") points = validatePointList(raw.params?.points, 2, `图元「${id}」points（[半径, 高度]）`)
   else if (raw.primitive === "tube") points = validatePointList(raw.params?.points, 3, `图元「${id}」points（路径点 [x,y,z]）`)
+  else if (raw.primitive === "sweep") {
+    points = validatePointList(raw.params?.points, 3, `图元「${id}」points（路径点 [x,y,z]）`)
+    profile = validateSweepProfile(raw.params?.profile ?? { shape: "circle" }, id)
+  }
+  else if (raw.primitive === "extrude") {
+    points = validatePointList(raw.params?.points, 2, `图元「${id}」points（XZ 截面点 [x,z]）`)
+    if (points.length < 3) throw new Error(`图元「${id}」：extrude 截面至少需要 3 个点。`)
+  }
+  else if (raw.primitive === "heightfield") heights = validateHeights(raw.params?.heights, id)
   if (raw.params !== undefined) {
     if (typeof raw.params !== "object" || raw.params === null || Array.isArray(raw.params)) throw new Error(`图元「${id}」：params 必须是对象。`)
     const keys = Object.keys(raw.params)
     if (keys.length > 12) throw new Error(`图元「${id}」：params 参数过多。`)
     for (const key of keys) {
-      if (key === "points") continue
+      if (key === "points" || key === "profile" || key === "heights") continue
       const isSegments = /segments[a-zA-Z]?/i.test(key)
-      params[key] = paramValue(raw.params[key], isSegments ? 3 : 0.0001, isSegments ? 256 : 10000, `图元「${id}」参数 ${key}`)
+      const isFlag = key === "closed" || key === "bevel"
+      params[key] = isFlag
+        ? (Number(raw.params[key]) === 1 ? 1 : 0)
+        : paramValue(raw.params[key], isSegments ? 3 : 0.0001, isSegments ? 256 : 10000, `图元「${id}」参数 ${key}`)
     }
   }
   if (points) params.points = points
+  if (profile) params.profile = profile
+  if (heights) params.heights = heights
   if (raw.primitive === "rounded_box") {
     const w = params.width ?? 1, h = params.height ?? 1, d = params.depth ?? 1
     const r = params.radius ?? 0.1
@@ -334,11 +379,18 @@ const pathSchema = {
   properties: { path: { type: "string", description: "模型文件的本地绝对路径" } },
   required: ["path"], additionalProperties: false,
 }
+const openModelSchema = {
+  type: "object",
+  properties: {
+    path: { type: "string", description: "模型文件的本地绝对路径；省略时只打开建模工作台，并导入服务器里最近注册的模型（用户无需提供路径）" },
+  },
+  additionalProperties: false,
+}
 const tools = [
   {
     name: "open_model", title: "预览模型",
-    description: "加载本地 3D 模型文件并自动打开建模工作台导入。浏览器端直接支持 glb/gltf/obj/stl/ply/fbx/3mf/dae；其他格式（.blend、STEP 等）经配置的 Blender 或自定义适配器转换。导入时页面会询问并入当前盘或新建盘（首个模型默认新建盘）。",
-    inputSchema: pathSchema,
+    description: "加载本地 3D 模型文件并自动打开建模工作台导入。浏览器端直接支持 glb/gltf/obj/stl/ply/fbx/3mf/dae；其他格式（.blend、STEP 等）经配置的 Blender 或自定义适配器转换。导入时页面会询问并入当前盘或新建盘（首个模型默认新建盘）。省略 path 时只打开工作台（不读任何文件），用于让用户直接点击卡片进入视图。",
+    inputSchema: openModelSchema,
     annotations: { readOnlyHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: UI_URI } },
   },
@@ -383,7 +435,7 @@ const tools = [
   },
   {
     name: "agent_create_model", title: "AI 生成模型",
-    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}、lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转：杯/瓶/底座，端点半径 0 封闭）、tube{points:[[x,y,z],…2–64],radius}（沿路径管道：把手/扶手/线缆，closed:1 成环）。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道 64×16，上限 256），球冠/圆柱端面等有明细需求时显式加大。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器雏形等组合体；复杂曲面/雕刻请改用外部建模软件产出 GLB 再 open_model。",
+    description: "由 Qoder Agent 用参数化图元组合生成基础 3D 模型（规格化程序建模，无需外部服务）。规则图元：box{width,height,depth}、rounded_box{width,height,depth,radius}（圆角，radius<最小边长一半）、sphere{radius}、cylinder{radiusTop,radiusBottom,height}、cone{radius,height}、pyramid{radius,height}（四棱锥）、torus{radius,tube}、capsule{radius,height}、plane{width,height}。工程曲面图元：lathe{points:[[半径,y],…2–64]}（轮廓绕 Y 轴旋转成回转体：杯/瓶/罐/塔，端点半径 0 封闭）；tube{points:[[x,y,z],…2–64],radius}（沿路径扫掠圆截面：把手/扶手/管线，closed:1 成环）；sweep{points:[[x,y,z],…2–64] 路径, profile:{shape:circle{radius}|rect{width,height}|polygon{points:[[x,y],…3–32]}}, twistDeg, tubularSegments, closed}（沿路径扫掠任意截面：型材/梁/异形扶手，比 tube 可换方/多边形截面并沿程扭转）；extrude{points:[[x,z],…3–64] 截面, depth, bevel:1, bevelSize, bevelSegments}（把平面轮廓沿 Y 拉伸成实体：法兰/垫片/L 支架/带孔板轮廓）；heightfield{width, depth, heights:[[…],2–33 行×2–33 列]}（高度场网格曲面：地形/波纹板/弧面薄壳，逐格给 y 值）。精度：segments 控制细分（球默认 48、圆柱/圆锥 32、环面管向 64、旋转 48、管道/扫掠 64×16、扫掠分段 32，上限 256）。坐标约定 Y-up、单位米、地面 y=0。每个图元可带 position/rotationDeg/scale/color(#rrggbb)/metalness/roughness/visible。成功后工作台自动导入（用户选择并入当前盘或新建盘）。适合桌椅、杯子、塔、机器、型材/地形等组合体；真正的自由曲面（雕刻、NURBS、扫描重建）请改用外部建模软件产出 GLB 再 open_model。",
     inputSchema: {
       type: "object",
       properties: {
@@ -413,9 +465,9 @@ const tools = [
   // ---- 仅 App 页面可见 ----
   {
     name: "open_viewer", title: "建模视图",
-    description: "打开建模工作台独立视图：盘大纲、预览、编辑与导出。",
+    description: "打开建模工作台独立视图：盘大纲、预览、编辑与导出。不需要任何参数或文件路径；页面会自行导入最近注册或生成的模型。Agent 在生成/导出模型后应调用它，让对话里出现可点击的工作台卡片。",
     inputSchema: emptySchema, annotations: { readOnlyHint: true },
-    _meta: { ui: { resourceUri: UI_URI, visibility: ["app"] }, "qoder/ui": { entrypoints: [{ type: "global" }, { type: "thread" }] } },
+    _meta: { ui: { resourceUri: UI_URI }, "qoder/ui": { entrypoints: [{ type: "global" }, { type: "thread" }] } },
   },
   {
     name: "load_local_file", title: "加载本地文件",
@@ -510,14 +562,22 @@ const modelLoadResult = model => ({
   content: [{ type: "text", text: `已加载「${model.name}」（${model.format.toUpperCase()}，${(model.sizeBytes / 1024).toFixed(0)} KB${model.converted ? "，经 " + model.converter + " 转换" : ""}）。建模工作台将导入该模型：已有盘时可选择并入当前盘或新建盘。` }],
   structuredContent: { model: summary(model), models: modelList(), activeModelId: model.id, workspace },
 })
+const viewerResult = text => ({
+  content: [{ type: "text", text }],
+  structuredContent: { models: modelList(), activeModelId, workspace },
+})
 
 async function callTool(name, args) {
   switch (name) {
     case "open_model":
-    case "load_local_file": {
-      const model = await registerFile(args.path)
-      return modelLoadResult(model)
-    }
+      if (args.path === undefined || args.path === null || args.path === "") {
+        return viewerResult(workspace.plates.length
+          ? `建模工作台已打开：${workspace.plates.length} 个盘，页面会导入最近注册的模型（无需提供文件路径）。`
+          : "建模工作台已打开，服务器里还没有已注册的模型。拖入文件、点击对话区链接或让 Agent 生成模型即可。")
+      }
+      return modelLoadResult(await registerFile(args.path))
+    case "load_local_file":
+      return modelLoadResult(await registerFile(args.path))
     case "upload_import_chunk": {
       cleanupUploads()
       if (typeof args.uploadId !== "string" || !args.uploadId) throw new Error("uploadId 无效。")
@@ -865,8 +925,12 @@ async function handle(request) {
         })
       }
       case "ping": return reply({ id, result: {} })
-      case "tools/list":
-        return reply({ id, result: { tools: offersApps ? tools : tools.filter(tool => !tool._meta?.["qoder/ui"]?.entrypoints) } })
+      case "tools/list": {
+        // 宿主未声明 UI 能力时仍保留 open_viewer：它同时是菜单入口与 Agent 调起工作台的唯一途径
+        const visible = offersApps ? tools
+          : tools.filter(tool => tool.name === "open_viewer" || !tool._meta?.["qoder/ui"]?.entrypoints)
+        return reply({ id, result: { tools: visible } })
+      }
       case "resources/list": return reply({ id, result: { resources: listResources() } })
       case "resources/read": {
         try { return reply({ id, result: readResource(String(params.uri ?? "")) }) }

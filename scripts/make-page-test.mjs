@@ -77,6 +77,8 @@ const harness = `<!DOCTYPE html>
 <iframe id="app" src="./viewer.injected.html" style="width:100%;height:640px;border:0"></iframe>
 <script>
 const CALLS = []; window.__calls = CALLS;
+// ?dl=<深链接 URL> 模拟宿主在 initialize 的 hostContext 里带上深链接（页面尚未 ready 时的排队路径）
+window.__bootDeepLink = new URLSearchParams(location.search).get("dl") || "";
 window.__manifests = { test: ${JSON.stringify(manifest)}, test2: ${JSON.stringify(manifest2)}, spec1: ${JSON.stringify(manifestSpec)} };
 window.__specDoc = ${JSON.stringify(specDoc)};
 const GLB_B64 = "${glb.toString("base64")}";
@@ -133,7 +135,7 @@ window.addEventListener("message", e => {
     case "ui/initialize":
       result = { protocolVersion: "2026-01-26",
         hostCapabilities: { serverTools: {}, serverResources: {}, message: {}, updateModelContext: {}, downloadFile: {}, experimental: { "qoder/files": {} } },
-        hostContext: { theme: "light", displayMode: "fullscreen" } };
+        hostContext: { theme: "light", displayMode: "fullscreen", ...(window.__bootDeepLink ? { "qoder/deepLink": { url: window.__bootDeepLink } } : {}) } };
       break;
     case "tools/call": {
       const n = m.params.name, a = m.params.arguments || {};

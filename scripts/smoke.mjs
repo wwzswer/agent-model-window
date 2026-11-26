@@ -64,8 +64,10 @@ try {
   check("工具齐全", ["open_model", "export_model", "list_models", "get_workspace", "get_model_info", "list_adapters", "agent_create_model", "agent_modify_model", "open_viewer", "load_local_file", "upload_import_chunk", "commit_import", "update_workspace_state", "upload_export_chunk", "save_export_to_path", "settings_read", "settings_update"].every(n => names.includes(n)))
   const openViewer = toolList.find(t => t.name === "open_viewer")
   check("入口声明 global+thread", JSON.stringify(openViewer._meta["qoder/ui"].entrypoints) === JSON.stringify([{ type: "global" }, { type: "thread" }]))
+  check("open_viewer 对 Agent 可见", !openViewer._meta.ui.visibility && Boolean(openViewer._meta.ui.resourceUri))
   check("写操作仅 App 可见", toolList.filter(t => t._meta?.ui?.visibility?.includes("app")).length >= 6)
   check("占位工具存在", names.includes("agent_create_model") && names.includes("agent_modify_model"))
+  check("open_model 可省略 path", !toolList.find(t => t.name === "open_model").inputSchema.required?.includes("path"))
   const createTool = toolList.find(t => t.name === "agent_create_model")
   check("AI 建模不再是占位", createTool.title.includes("AI 生成模型") && !createTool.description.includes("not_implemented"))
 
@@ -95,6 +97,9 @@ try {
   check("manifest 正确", manifest.chunkCount === 1 && manifest.sizeBytes === stl.length && manifest.payload === "binary")
   const chunk = (await rpc("resources/read", { uri: `model://${modelId}/data/0` })).result.contents[0]
   check("分块数据一致", Buffer.from(chunk.blob, "base64").equals(stl))
+
+  const bare = await call("open_model", {})
+  check("open_model 免路径只打开视图", !bare.isError && Array.isArray(bare.structuredContent?.models) && bare.structuredContent?.activeModelId === modelId)
 
   // ---- OBJ + MTL bundle ----
   const objPath = path.join(tmp, "quad.obj")
@@ -229,6 +234,31 @@ try {
   check("lathe 点数不足被拒绝", badLathe.isError === true)
   const badTube = await call("agent_create_model", { parts: [{ primitive: "tube", params: { points: [[0, 0, 0], [1, "x", 0]] } }] })
   check("tube 非法点被拒绝", badTube.isError === true)
+
+  // ---- 工程曲面图元：sweep / extrude / heightfield ----
+  const surfaces = await call("agent_create_model", {
+    name: "曲面演示", parts: [
+      { id: "terrain", primitive: "heightfield", params: { width: 2, depth: 2, heights: [[0, 0.1, 0.2], [0.1, 0.5, 0.2], [0.2, 0.2, 0]] }, position: [0, 0, 0] },
+      { id: "beam", primitive: "sweep", params: { points: [[-1, 0.3, 0], [0, 0.3, 0], [1, 0.3, 0]], profile: { shape: "rect", width: 0.1, height: 0.2 }, tubularSegments: 24 }, position: [0, 0, 0] },
+      { id: "rail", primitive: "sweep", params: { points: [[0, 0.4, -1], [0, 0.4, 0], [0, 0.4, 1]], profile: { shape: "polygon", points: [[-0.03, -0.03], [0.03, -0.03], [0, 0.04]] }, twistDeg: 90, closed: 0 } },
+      { id: "flange", primitive: "extrude", params: { points: [[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3], [-0.3, 0.3]], depth: 0.05, bevel: 1, bevelSize: 0.02 }, position: [0.8, 0.2, 0.8] },
+    ],
+  })
+  check("工程曲面图元通过校验", !surfaces.isError && surfaces.structuredContent?.model?.format === "spec")
+  const surfJson = JSON.parse(Buffer.from((await rpc("resources/read", { uri: `model://${surfaces.structuredContent?.model?.id}/data/0` })).result.contents[0].blob, "base64").toString("utf8"))
+  check("sweep profile 原样持久化", surfJson.parts.find(p => p.id === "beam")?.params?.profile?.shape === "rect" && surfJson.parts.find(p => p.id === "rail")?.params?.profile?.points?.length === 3)
+  check("heightfield heights 二维持久化", Array.isArray(surfJson.parts.find(p => p.id === "terrain")?.params?.heights?.[1]) && surfJson.parts.find(p => p.id === "terrain")?.params?.heights?.[1]?.[1] === 0.5)
+  check("extrude points 二维持久化", surfJson.parts.find(p => p.id === "flange")?.params?.points?.[0]?.length === 2)
+  const badSweepProfile = await call("agent_create_model", { parts: [{ primitive: "sweep", params: { points: [[0, 0, 0], [1, 0, 0]], profile: { shape: "hexagon" } } }] })
+  check("sweep 非法截面类型被拒绝", badSweepProfile.isError === true)
+  const badSweepPoly = await call("agent_create_model", { parts: [{ primitive: "sweep", params: { points: [[0, 0, 0], [1, 0, 0]], profile: { shape: "polygon", points: [[0, 0], [1, 0]] } } }] })
+  check("sweep polygon 点数不足被拒绝", badSweepPoly.isError === true)
+  const badExtrude = await call("agent_create_model", { parts: [{ primitive: "extrude", params: { points: [[0, 0], [1, 0]], depth: 0.1 } }] })
+  check("extrude 点数不足被拒绝", badExtrude.isError === true)
+  const badHfRagged = await call("agent_create_model", { parts: [{ primitive: "heightfield", params: { width: 1, depth: 1, heights: [[0, 1], [0]] } }] })
+  check("heightfield 行宽不一致被拒绝", badHfRagged.isError === true)
+  const badHfTooBig = await call("agent_create_model", { parts: [{ primitive: "heightfield", params: { width: 1, depth: 1, heights: Array.from({ length: 40 }, () => Array.from({ length: 40 }, () => 0)) } }] })
+  check("heightfield 超尺寸被拒绝", badHfTooBig.isError === true)
 
   // 盘对象级操作 + spec 图元级修改
   const wsSpec = { plates: [{ id: plateId, name: "盘 1", visible: true, items: [...workspace.plates[0].items, { id: "item-spec", modelId: specId, name: "小桌", position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], visible: true }] }], activePlateId: plateId }
